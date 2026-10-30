@@ -416,6 +416,16 @@ pub fn ensure_installed(
         net::download_many(client, plan.downloads, "下载依赖库")?;
     }
 
+    // 日志配置是可选项：镜像缺失时回退官方源，仍失败只提示不中断安装。
+    if let Some(logging) = version.logging.as_ref().and_then(|l| l.client.as_ref())
+        && !logging.file.url.is_empty()
+    {
+        let path = assets_dir(&root).join("log_configs").join(&logging.file.id);
+        if let Err(err) = ensure_log_config(client, cfg.mirror, &logging.file, &path) {
+            ui::warn(format!("日志配置下载失败，已跳过：{err:#}"));
+        }
+    }
+
     if !plan.natives.is_empty() {
         let natives = natives_dir(&root, &entry.id);
         fs::create_dir_all(&natives)?;
@@ -431,6 +441,31 @@ pub fn ensure_installed(
     }
 
     Ok(version)
+}
+
+/// 下载 log4j 配置：先试镜像，失败后回退官方地址。
+fn ensure_log_config(
+    client: &Client,
+    mirror: MirrorKind,
+    file: &LoggingFile,
+    path: &Path,
+) -> Result<()> {
+    let mut urls = vec![file.url.clone()];
+    if mirror != MirrorKind::Official {
+        urls.insert(0, mirror.rewrite(&file.url));
+    }
+
+    let mut last_err = None;
+    for url in urls {
+        let task = DownloadTask::new(url, path.to_path_buf())
+            .with_hash(file.sha1.clone())
+            .with_size(file.size);
+        match net::download_one(client, &task, "下载日志配置") {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("日志配置地址为空")))
 }
 
 fn client_artifact_url(artifact: &Artifact) -> String {
@@ -687,17 +722,6 @@ pub fn plan_libraries(
                     .with_size(resolved.size),
             );
         }
-    }
-
-    if let Some(logging) = version.logging.as_ref().and_then(|l| l.client.as_ref())
-        && !logging.file.url.is_empty()
-    {
-        let path = assets_dir(root).join("log_configs").join(&logging.file.id);
-        downloads.push(
-            DownloadTask::new(mirror.rewrite(&logging.file.url), path)
-                .with_hash(logging.file.sha1.clone())
-                .with_size(logging.file.size),
-        );
     }
 
     // 旧版库可能没有 downloads 字段，此时会使用 Maven 默认地址补全。

@@ -25,10 +25,14 @@ pub struct Ui {
     width: u16,
     height: u16,
     row: u16,
+    /// 启动前的控制台代码页（Windows），退出时还原。
+    codepage: Option<(u32, u32)>,
 }
 
 impl Ui {
     pub fn enter() -> Result<Self> {
+        // 统一使用 UTF-8 代码页，避免中文界面出现乱码。
+        let codepage = switch_to_utf8();
         enable_raw_mode()?;
         let mut out = std::io::stdout();
         execute!(out, EnterAlternateScreen, Hide)?;
@@ -38,6 +42,7 @@ impl Ui {
             width,
             height,
             row: 0,
+            codepage,
         })
     }
 
@@ -586,8 +591,50 @@ impl Drop for Ui {
         let _ = disable_raw_mode();
         let _ = execute!(self.out, LeaveAlternateScreen, Show);
         let _ = self.out.flush();
+        if let Some((input, output)) = self.codepage.take() {
+            restore_codepage(input, output);
+        }
     }
 }
+
+const UTF8_CODEPAGE: u32 = 65001;
+
+/// 将控制台输入/输出代码页切换为 UTF-8，返回切换前的代码页用于还原。
+#[cfg(windows)]
+fn switch_to_utf8() -> Option<(u32, u32)> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
+    };
+
+    unsafe {
+        let input = GetConsoleCP();
+        let output = GetConsoleOutputCP();
+        if input == 0 || output == 0 {
+            return None;
+        }
+        SetConsoleCP(UTF8_CODEPAGE);
+        SetConsoleOutputCP(UTF8_CODEPAGE);
+        Some((input, output))
+    }
+}
+
+#[cfg(windows)]
+fn restore_codepage(input: u32, output: u32) {
+    use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+
+    unsafe {
+        SetConsoleCP(input);
+        SetConsoleOutputCP(output);
+    }
+}
+
+#[cfg(not(windows))]
+fn switch_to_utf8() -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(not(windows))]
+fn restore_codepage(_input: u32, _output: u32) {}
 
 fn truncate(text: &str, max: usize) -> String {
     if max == 0 {
