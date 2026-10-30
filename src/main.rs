@@ -76,6 +76,7 @@ fn run(ui: &mut Ui) -> Result<()> {
             ui,
             "Minecraft 启动器",
             "↑↓ 选择，Enter 确认，Esc 退出",
+            "↑↓ 选择    Enter 确认    Esc 退出",
             &rows,
             &items,
             selected,
@@ -154,6 +155,7 @@ fn menu_loop(
     ui: &mut Ui,
     title: &str,
     subtitle: &str,
+    hint: &str,
     card: &[(&str, String)],
     items: &[String],
     initial: usize,
@@ -166,7 +168,7 @@ fn menu_loop(
             ui.blank()?;
         }
         ui.menu(items, selected)?;
-        ui.footer("↑↓ 选择    Enter 确认    Esc 返回")?;
+        ui.footer(hint)?;
         ui.flush()?;
 
         match ui.key()?.code {
@@ -525,6 +527,7 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
             ui,
             "账户管理",
             "↑↓ 选择   Enter 确认   Esc 返回",
+            "↑↓ 选择    Enter 确认    Esc 返回",
             &rows,
             &items,
             selected,
@@ -626,6 +629,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
             ui,
             "启动器设置",
             "↑↓ 选择   Enter 修改   Esc 返回",
+            "↑↓ 选择    Enter 修改    Esc 返回",
             &[],
             &items,
             selected,
