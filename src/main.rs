@@ -497,6 +497,7 @@ fn choose_version(
     let mut scope = VersionScope::All;
     let mut start = 0usize;
     let mut selected = rows.iter().position(|row| row.id == current).unwrap_or(0);
+    let mut blink = true;
 
     loop {
         let needle = filter.to_lowercase();
@@ -557,8 +558,10 @@ fn choose_version(
             ],
         )?;
         ui.blank()?;
+        let filter_row = ui.row();
         ui.line(&format!(
-            "  筛选：{filter}▏        范围：{}（Tab 切换）",
+            "  筛选：{filter}{}        范围：{}（Tab 切换）",
+            if blink { "▏" } else { " " },
             scope.label()
         ))?;
         ui.blank()?;
@@ -592,7 +595,23 @@ fn choose_version(
         ui.footer("↑↓ 选择    Enter 选择并启动    F1/F2 快捷启动    Tab 切换    Esc 返回")?;
         ui.flush()?;
 
-        let key = ui.key()?;
+        // 等待按键期间让筛选框的光标闪烁，只重绘筛选行。
+        let key = loop {
+            if let Some(key) = ui.poll_key(ui::BLINK_INTERVAL)? {
+                blink = true;
+                break key;
+            }
+            blink = !blink;
+            ui.rewrite_line(
+                filter_row,
+                &format!(
+                    "  筛选：{filter}{}        范围：{}（Tab 切换）",
+                    if blink { "▏" } else { " " },
+                    scope.label()
+                ),
+            )?;
+            ui.flush()?;
+        };
         match key.code {
             KeyCode::Esc => return Ok(None),
             KeyCode::F(1) => return Ok(Some(manifest.latest.release.clone())),

@@ -17,6 +17,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub type InputValidator<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 
+/// 光标闪烁周期。
+pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
 pub struct Ui {
     out: Stdout,
     width: u16,
@@ -345,6 +348,37 @@ impl Ui {
         Ok(false)
     }
 
+    pub fn poll_key(&self, timeout: Duration) -> Result<Option<KeyEvent>> {
+        if !event::poll(timeout)? {
+            return Ok(None);
+        }
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => return Ok(Some(key)),
+                _ => {
+                    if !event::poll(Duration::from_millis(0))? {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 原地重写一行，用于光标闪烁时局部刷新。
+    pub fn rewrite_line(&mut self, row: u16, text: &str) -> Result<()> {
+        if row >= self.height {
+            return Ok(());
+        }
+        let text = truncate(text, self.width as usize);
+        queue!(
+            self.out,
+            MoveTo(0, row),
+            Clear(ClearType::CurrentLine),
+            Print(text)
+        )?;
+        Ok(())
+    }
+
     pub fn begin_work(
         &mut self,
         title: impl std::fmt::Display,
@@ -405,73 +439,90 @@ impl Ui {
         let mut chars: Vec<char> = initial.chars().collect();
         let mut cursor = chars.len();
         let mut error: Option<String> = None;
-        execute!(self.out, Show)?;
+        let mut blink = true;
+        let mut full = true;
+        let mut input_row = 0u16;
 
         loop {
             let text_max = (self.width as usize).saturating_sub(8).max(4);
-            let (shown, caret) = visible_input(&chars, cursor, text_max);
+            let (before, after) = visible_input(&chars, cursor, text_max);
+            let before_width = UnicodeWidthStr::width(before.as_str());
+            let after_width = UnicodeWidthStr::width(after.as_str());
 
-            self.header(title, hint)?;
-            let input_row = self.row;
-            let shown = truncate(&shown, text_max);
-            let shown_width = UnicodeWidthStr::width(shown.as_str());
+            if full {
+                self.header(title, hint)?;
+                input_row = self.row;
+                self.row = input_row + 1;
+                self.blank()?;
+                match &error {
+                    Some(message) => {
+                        self.print_line(&format!("  {message}"), Some(Color::Red), false, false)?
+                    }
+                    None => self.blank()?,
+                }
+                self.footer("Enter 确认    Esc 取消")?;
+                full = false;
+            }
+
+            // 光标用自行绘制的闪烁竖线，不再依赖终端系统光标。
+            let caret = if blink { "▏" } else { " " };
+            let padding = text_max.saturating_sub(before_width + after_width);
             queue!(
                 self.out,
-                MoveTo(2, input_row),
+                MoveTo(0, input_row),
+                Clear(ClearType::CurrentLine),
                 SetForegroundColor(Color::Cyan),
                 SetAttribute(Attribute::Bold),
+                MoveTo(2, input_row),
                 Print("› "),
                 ResetColor,
                 SetAttribute(Attribute::Reset),
-                Print(shown),
-                Print(" ".repeat(text_max.saturating_sub(shown_width))),
-                MoveTo(4 + caret.min(text_max) as u16, input_row),
-                Show
+                Print(before),
+                Print(caret),
+                Print(after),
+                Print(" ".repeat(padding))
             )?;
-            self.row = input_row + 1;
-            self.blank()?;
-            match &error {
-                Some(message) => {
-                    self.print_line(&format!("  {message}"), Some(Color::Red), false, false)?
-                }
-                None => self.blank()?,
-            }
-            self.footer("Enter 确认    Esc 取消")?;
             self.flush()?;
 
-            let key = self.key()?;
+            let Some(key) = self.poll_key(BLINK_INTERVAL)? else {
+                blink = !blink;
+                continue;
+            };
+            blink = true;
+
             match key.code {
-                KeyCode::Esc => {
-                    execute!(self.out, Hide)?;
-                    return Ok(None);
-                }
+                KeyCode::Esc => return Ok(None),
                 KeyCode::Enter => {
                     let text: String = chars.iter().collect();
                     let trimmed = text.trim();
-                    if !allow_empty && trimmed.is_empty() {
-                        error = Some("不能为空".to_string());
-                        continue;
+                    let message = if !allow_empty && trimmed.is_empty() {
+                        Some("不能为空".to_string())
+                    } else {
+                        validator.and_then(|validate| validate(trimmed).err())
+                    };
+                    match message {
+                        Some(message) => {
+                            error = Some(message);
+                            full = true;
+                        }
+                        None => return Ok(Some(trimmed.to_string())),
                     }
-                    if let Some(validate) = validator
-                        && let Err(message) = validate(trimmed)
-                    {
-                        error = Some(message);
-                        continue;
-                    }
-                    execute!(self.out, Hide)?;
-                    return Ok(Some(trimmed.to_string()));
                 }
                 KeyCode::Backspace => {
                     if cursor > 0 {
                         cursor -= 1;
                         chars.remove(cursor);
-                        error = None;
+                        if error.take().is_some() {
+                            full = true;
+                        }
                     }
                 }
                 KeyCode::Delete => {
                     if cursor < chars.len() {
                         chars.remove(cursor);
-                        error = None;
+                        if error.take().is_some() {
+                            full = true;
+                        }
                     }
                 }
                 KeyCode::Left => cursor = cursor.saturating_sub(1),
@@ -484,7 +535,9 @@ impl Ui {
                 {
                     chars.insert(cursor, c);
                     cursor += 1;
-                    error = None;
+                    if error.take().is_some() {
+                        full = true;
+                    }
                 }
                 _ => {}
             }
@@ -562,27 +615,29 @@ fn pad(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(width.saturating_sub(text_width)))
 }
 
-/// 返回（可见文本、光标在文本中的显示宽度）。
-fn visible_input(chars: &[char], cursor: usize, max_width: usize) -> (String, usize) {
-    let limit = max_width.saturating_sub(2);
+/// 返回（光标前的可见文本、光标后的可见文本），并为光标预留一列。
+fn visible_input(chars: &[char], cursor: usize, max_width: usize) -> (String, String) {
+    let budget = max_width.saturating_sub(1);
+    let limit = budget.saturating_sub(2);
     let mut start = 0usize;
     while start < cursor && width_of(&chars[start..cursor]) > limit {
         start += 1;
     }
 
-    let caret = width_of(&chars[start..cursor]);
-
-    let mut shown = String::new();
-    let mut width = 0usize;
-    for ch in chars.iter().skip(start) {
-        let char_width = char_width_of(Some(ch));
-        if width + char_width > max_width {
+    let mut width = width_of(&chars[start..cursor]);
+    let mut end = cursor;
+    while end < chars.len() {
+        let char_width = char_width_of(Some(&chars[end]));
+        if width + char_width > budget {
             break;
         }
-        shown.push(*ch);
         width += char_width;
+        end += 1;
     }
-    (shown, caret)
+
+    let before: String = chars[start..cursor].iter().collect();
+    let after: String = chars[cursor..end].iter().collect();
+    (before, after)
 }
 
 fn width_of(chars: &[char]) -> usize {
