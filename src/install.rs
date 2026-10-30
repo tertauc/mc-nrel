@@ -21,8 +21,10 @@ pub struct VersionJson {
     pub id: String,
     #[serde(rename = "type", default)]
     pub kind: String,
-    #[serde(rename = "mainClass")]
+    #[serde(rename = "mainClass", default)]
     pub main_class: String,
+    #[serde(rename = "inheritsFrom", default)]
+    pub inherits_from: Option<String>,
     #[serde(rename = "minecraftArguments", default)]
     pub minecraft_arguments: Option<String>,
     #[serde(default)]
@@ -233,10 +235,138 @@ pub fn read_local_version(root: &Path, id: &str) -> Option<VersionJson> {
     serde_json::from_str(&text).ok()
 }
 
+/// 读取本地版本并合并 `inheritsFrom` 父版本（Forge、OptiFine 等常见于整合包）。
+pub fn load_version_merged(root: &Path, id: &str) -> Option<VersionJson> {
+    load_version_recursive(root, id, 0)
+}
+
+fn load_version_recursive(root: &Path, id: &str, depth: usize) -> Option<VersionJson> {
+    if depth > 8 {
+        return None;
+    }
+    let version = read_local_version(root, id)?;
+    let Some(parent_id) = version.inherits_from.clone() else {
+        return Some(version);
+    };
+    let parent = load_version_recursive(root, &parent_id, depth + 1)?;
+    Some(merge_versions(parent, version))
+}
+
+fn merge_versions(mut parent: VersionJson, mut child: VersionJson) -> VersionJson {
+    if child.main_class.is_empty() {
+        child.main_class = parent.main_class;
+    }
+    if child.minecraft_arguments.is_none() {
+        child.minecraft_arguments = parent.minecraft_arguments;
+    }
+    if let Some(parent_args) = parent.arguments.take() {
+        match child.arguments.take() {
+            Some(mut args) => {
+                let mut jvm = parent_args.jvm;
+                jvm.extend(args.jvm);
+                let mut game = parent_args.game;
+                game.extend(args.game);
+                args.jvm = jvm;
+                args.game = game;
+                child.arguments = Some(args);
+            }
+            None => child.arguments = Some(parent_args),
+        }
+    }
+
+    let mut libraries = parent.libraries;
+    for library in child.libraries {
+        match libraries.iter().position(|item| item.name == library.name) {
+            Some(index) => libraries[index] = library,
+            None => libraries.push(library),
+        }
+    }
+    child.libraries = libraries;
+
+    if child.asset_index.is_none() {
+        child.asset_index = parent.asset_index;
+    }
+    if child.assets.is_none() {
+        child.assets = parent.assets;
+    }
+    if child.downloads.is_none() {
+        child.downloads = parent.downloads;
+    }
+    if child.java_version.is_none() {
+        child.java_version = parent.java_version;
+    }
+    if child.logging.is_none() {
+        child.logging = parent.logging;
+    }
+    if child.kind.is_empty() {
+        child.kind = parent.kind;
+    }
+
+    child
+}
+
+pub fn has_local_version(root: &Path, id: &str) -> bool {
+    version_dir(root, id).join(format!("{id}.json")).is_file()
+}
+
 pub fn is_version_installed(root: &Path, id: &str) -> bool {
     let json = version_dir(root, id).join(format!("{id}.json"));
     let jar = version_jar_path(root, id);
     json.is_file() && jar.is_file()
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalVersion {
+    pub id: String,
+    pub kind: String,
+}
+
+impl LocalVersion {
+    pub fn kind_label(&self) -> &'static str {
+        kind_label(&self.kind)
+    }
+}
+
+pub fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        "release" => "正式版",
+        "snapshot" => "快照",
+        "old_beta" => "远古 Beta",
+        "old_alpha" => "远古 Alpha",
+        _ => "其他",
+    }
+}
+
+/// 扫描 `<游戏目录>/versions`，列出磁盘上已有的版本（包括第三方与整合包版本）。
+pub fn list_local_versions(root: &Path) -> Vec<LocalVersion> {
+    let dir = root.join("versions");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut versions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().to_string();
+        let Ok(text) = fs::read_to_string(path.join(format!("{id}.json"))) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let kind = value
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        versions.push(LocalVersion { id, kind });
+    }
+
+    versions.sort_by_key(|version| version.id.to_lowercase());
+    versions
 }
 
 /// 补全缺失的版本文件，已下载且大小正确的文件会自动跳过。

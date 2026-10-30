@@ -8,11 +8,11 @@ mod mirror;
 mod net;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::style::Color;
 use reqwest::blocking::Client;
@@ -31,6 +31,48 @@ const MAIN_MENU: [&str; 6] = [
     "刷新版本列表",
     "退出",
 ];
+
+/// 版本选择列表中的一行（官方清单版本 + 本地已有版本）。
+struct VersionRow {
+    id: String,
+    kind: String,
+    date: String,
+    installed: bool,
+    local_only: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VersionScope {
+    All,
+    Installed,
+    Local,
+}
+
+impl VersionScope {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Installed,
+            Self::Installed => Self::Local,
+            Self::Local => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "全部",
+            Self::Installed => "已安装",
+            Self::Local => "本地",
+        }
+    }
+
+    fn matches(self, row: &VersionRow) -> bool {
+        match self {
+            Self::All => true,
+            Self::Installed => row.installed,
+            Self::Local => row.local_only,
+        }
+    }
+}
 
 /// Minecraft 登录令牌的保守有效期，留一小时余量。
 const MC_TOKEN_LIFETIME: i64 = 24 * 60 * 60;
@@ -93,7 +135,14 @@ fn run(ui: &mut Ui) -> Result<()> {
                 None => missing_manifest(ui),
             },
             1 => match &manifest {
-                Some(manifest) => choose_version(ui, &mut cfg, manifest),
+                Some(manifest) => match choose_version(ui, &mut cfg, manifest)? {
+                    Some(id) => {
+                        cfg.last_version = Some(id);
+                        cfg.save()?;
+                        start_game(ui, &client, &mut cfg, manifest)
+                    }
+                    None => Ok(()),
+                },
                 None => missing_manifest(ui),
             },
             2 => account_menu(ui, &client, &mut cfg),
@@ -204,10 +253,14 @@ fn overview_rows(cfg: &Config, manifest: Option<&VersionManifest>) -> Vec<(&'sta
 }
 
 fn current_version_id(cfg: &Config, manifest: &VersionManifest) -> String {
-    cfg.last_version
-        .clone()
-        .filter(|id| manifest.contains(id))
-        .unwrap_or_else(|| manifest.latest.release.clone())
+    if let Some(id) = &cfg.last_version
+        && (manifest.contains(id)
+            || install::is_version_installed(&cfg.game_dir(), id)
+            || install::has_local_version(&cfg.game_dir(), id))
+    {
+        return id.clone();
+    }
+    manifest.latest.release.clone()
 }
 
 fn memory_label(cfg: &Config) -> String {
@@ -231,10 +284,7 @@ fn start_game(
     manifest: &VersionManifest,
 ) -> Result<()> {
     let id = current_version_id(cfg, manifest);
-    let entry = manifest
-        .find(&id)
-        .cloned()
-        .with_context(|| format!("版本列表中不存在 {id}"))?;
+    let local_only = !manifest.contains(&id);
 
     if cfg.login_mode == LoginMode::Offline && cfg.username.trim().is_empty() {
         ui.alert(
@@ -252,6 +302,8 @@ fn start_game(
             "版本 {id} · {}",
             if installed {
                 "已安装"
+            } else if local_only {
+                "本地版本不完整"
             } else {
                 "未安装，将自动下载"
             }
@@ -262,7 +314,18 @@ fn start_game(
     ui.blank()?;
     ui.flush()?;
 
-    let version = install::ensure_installed(client, cfg, &entry)?;
+    let version = match manifest.find(&id) {
+        Some(entry) => install::ensure_installed(client, cfg, entry)?,
+        None => {
+            let local = install::load_version_merged(&root, &id).with_context(|| {
+                format!("无法读取本地版本 {id}（可能缺少父版本 JSON）")
+            })?;
+            if !installed {
+                bail!("本地版本 {id} 缺少客户端 jar，请确认 versions/{id}/{id}.jar 存在");
+            }
+            local
+        }
+    };
     let required = launch::required_java_major(&version);
 
     let java = match java::pick(cfg.java_path.as_deref(), required) {
@@ -390,64 +453,117 @@ fn choose_java(ui: &mut Ui, cfg: &mut Config, required: u32) -> Result<Option<ja
     }
 }
 
-fn choose_version(ui: &mut Ui, cfg: &mut Config, manifest: &VersionManifest) -> Result<()> {
-    let root = cfg.game_dir();
-    let current = current_version_id(cfg, manifest);
-    let mut filter = String::new();
-    let mut start = 0usize;
-    let mut selected = manifest
+fn collect_versions(root: &Path, manifest: &VersionManifest) -> Vec<VersionRow> {
+    let mut rows: Vec<VersionRow> = manifest
         .versions
         .iter()
-        .position(|entry| entry.id == current)
-        .unwrap_or(0);
+        .map(|entry| VersionRow {
+            id: entry.id.clone(),
+            kind: entry.kind_label().to_string(),
+            date: entry.date(),
+            installed: install::is_version_installed(root, &entry.id),
+            local_only: false,
+        })
+        .collect();
+
+    for local in install::list_local_versions(root) {
+        if rows.iter().any(|row| row.id == local.id) {
+            continue;
+        }
+        let kind = local.kind_label().to_string();
+        rows.push(VersionRow {
+            installed: install::is_version_installed(root, &local.id),
+            id: local.id,
+            kind,
+            date: "本地文件".to_string(),
+            local_only: true,
+        });
+    }
+
+    rows
+}
+
+fn choose_version(
+    ui: &mut Ui,
+    cfg: &mut Config,
+    manifest: &VersionManifest,
+) -> Result<Option<String>> {
+    let root = cfg.game_dir();
+    let current = current_version_id(cfg, manifest);
+    let rows = collect_versions(&root, manifest);
+    let installed_count = rows.iter().filter(|row| row.installed).count();
+
+    let mut filter = String::new();
+    let mut scope = VersionScope::All;
+    let mut start = 0usize;
+    let mut selected = rows.iter().position(|row| row.id == current).unwrap_or(0);
 
     loop {
         let needle = filter.to_lowercase();
-        let filtered: Vec<usize> = manifest
-            .versions
+        let visible: Vec<usize> = rows
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
+            .filter(|(_, row)| scope.matches(row))
+            .filter(|(_, row)| {
                 needle.is_empty()
-                    || entry.id.to_lowercase().contains(&needle)
-                    || entry.kind_label().contains(&needle)
+                    || row.id.to_lowercase().contains(&needle)
+                    || row.kind.contains(&filter)
             })
             .map(|(index, _)| index)
             .collect();
 
-        if filtered.is_empty() {
+        if visible.is_empty() {
             selected = 0;
-        } else if selected >= filtered.len() {
-            selected = filtered.len() - 1;
+        } else if selected >= visible.len() {
+            selected = visible.len() - 1;
         }
 
-        let items: Vec<String> = filtered
+        let items: Vec<String> = visible
             .iter()
             .map(|&index| {
-                let entry = &manifest.versions[index];
-                let mut text = format!(
-                    "{:<10}  {}  {}",
-                    entry.id,
-                    entry.kind_label(),
-                    entry.date()
-                );
-                if install::is_version_installed(&root, &entry.id) {
-                    text.push_str("  [已安装]");
+                let row = &rows[index];
+                let marker = if row.installed { "●" } else { "○" };
+                let mut suffix = String::new();
+                if row.local_only {
+                    suffix.push_str("  ◆ 本地");
                 }
-                if entry.id == current {
-                    text.push_str("  ← 当前");
+                if row.id == current {
+                    suffix.push_str("  ★ 当前");
                 }
-                text
+                format!(
+                    "{marker} {}  {}  {}{suffix}",
+                    pad_label(&row.id, 24),
+                    pad_label(&row.kind, 10),
+                    row.date
+                )
             })
             .collect();
 
         ui.header(
-            "选择版本",
-            "输入关键字筛选，↑↓ 选择，Enter 确认，Esc 返回",
+            "版本选择",
+            "F1 最新正式版 · F2 最新快照 · Tab 切换范围 · Enter 选择并启动 · Esc 返回",
         )?;
-        ui.line(&format!("  筛选：{filter}▏"))?;
+        ui.card(
+            "快捷启动",
+            &[
+                (
+                    "[F1] 最新正式版",
+                    format!("{}  ·  一键下载安装并启动", manifest.latest.release),
+                ),
+                (
+                    "[F2] 最新快照",
+                    format!("{}  ·  一键下载安装并启动", manifest.latest.snapshot),
+                ),
+            ],
+        )?;
         ui.blank()?;
-        let max_rows = (ui.height().saturating_sub(ui.row() + 2) as usize).max(1);
+        ui.line(&format!(
+            "  筛选：{filter}▏        范围：{}（Tab 切换）",
+            scope.label()
+        ))?;
+        ui.blank()?;
+
+        let max_rows = (ui.height().saturating_sub(ui.row().saturating_add(4)) as usize).max(1);
         if selected >= start + max_rows {
             start = selected + 1 - max_rows;
         }
@@ -455,31 +571,52 @@ fn choose_version(ui: &mut Ui, cfg: &mut Config, manifest: &VersionManifest) -> 
             start = selected;
         }
         ui.list(&items, selected, start, max_rows)?;
-        ui.dim_line(&format!("  共 {} 个版本", items.len()))?;
-        ui.footer("输入筛选    ↑↓ 选择    Enter 确认    Esc 返回")?;
+        ui.dim_line(&format!(
+            "  共 {} 个版本 · 已安装 {} 个 · 当前显示 {} 个",
+            rows.len(),
+            installed_count,
+            visible.len()
+        ))?;
+        if let Some(&index) = visible.get(selected) {
+            let row = &rows[index];
+            let status = if row.local_only {
+                "本地版本，直接使用现有文件"
+            } else if row.installed {
+                "已安装，直接启动"
+            } else {
+                "未安装，将自动下载后启动"
+            };
+            ui.blank()?;
+            ui.line(&format!("  已选 {} · {} · {status}", row.id, row.kind))?;
+        }
+        ui.footer("↑↓ 选择    Enter 选择并启动    F1/F2 快捷启动    Tab 切换    Esc 返回")?;
         ui.flush()?;
 
         let key = ui.key()?;
         match key.code {
-            KeyCode::Esc => return Ok(()),
+            KeyCode::Esc => return Ok(None),
+            KeyCode::F(1) => return Ok(Some(manifest.latest.release.clone())),
+            KeyCode::F(2) => return Ok(Some(manifest.latest.snapshot.clone())),
             KeyCode::Enter => {
-                if let Some(&index) = filtered.get(selected) {
-                    let id = manifest.versions[index].id.clone();
-                    cfg.last_version = Some(id);
-                    cfg.save()?;
-                    return Ok(());
+                if let Some(&index) = visible.get(selected) {
+                    return Ok(Some(rows[index].id.clone()));
                 }
+            }
+            KeyCode::Tab => {
+                scope = scope.next();
+                selected = 0;
+                start = 0;
             }
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Down => {
-                if !filtered.is_empty() {
-                    selected = (selected + 1).min(filtered.len() - 1);
+                if !visible.is_empty() {
+                    selected = (selected + 1).min(visible.len() - 1);
                 }
             }
             KeyCode::PageUp => selected = selected.saturating_sub(10),
             KeyCode::PageDown => {
-                if !filtered.is_empty() {
-                    selected = (selected + 10).min(filtered.len() - 1);
+                if !visible.is_empty() {
+                    selected = (selected + 10).min(visible.len() - 1);
                 }
             }
             KeyCode::Backspace => {

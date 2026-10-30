@@ -24,6 +24,9 @@ pub fn build_command(
     session: &Session,
 ) -> Result<Command> {
     let root = cfg.game_dir();
+    if version.main_class.is_empty() {
+        bail!("版本 {} 的 JSON 缺少 mainClass，无法启动", version.id);
+    }
     let game_jar = install::version_jar_path(&root, &version.id);
     if !game_jar.is_file() {
         bail!("客户端文件缺失: {}", game_jar.display());
