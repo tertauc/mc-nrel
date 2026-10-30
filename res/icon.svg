@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <!-- 背景主渐变：青色 → 靛蓝 -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+
+    <!-- 顶部高光：左上角透光 -->
+    <radialGradient id="sheen" cx="30%" cy="15%" r="80%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="50%"  stop-color="#FFFFFF" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- 底部暗角：自下而上的深色 -->
+    <linearGradient id="bottomShade" x1="0%" y1="100%" x2="0%" y2="30%">
+      <stop offset="0%"   stop-color="#312E81" stop-opacity="0.50"/>
+      <stop offset="100%" stop-color="#312E81" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- 内边缘高光：上亮下暗，模拟玻璃倒角 -->
+    <linearGradient id="rim" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="50%"  stop-color="#FFFFFF" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.02"/>
+    </linearGradient>
+
+    <!-- 字母渐变：顶部纯白 → 底部淡青 -->
+    <linearGradient id="fg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#FFFFFF"/>
+      <stop offset="55%"  stop-color="#ECFEFF"/>
+      <stop offset="100%" stop-color="#A5F3FC"/>
+    </linearGradient>
+
+    <!-- 字母投影 -->
+    <filter id="nShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14"
+                    flood-color="#1E3A8A" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- 背景：渐变 + 底暗 + 顶亮 + 内边缘高光，四层叠加出体积感 -->
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="116" fill="url(#bottomShade)"/>
+  <rect width="512" height="512" rx="116" fill="url(#sheen)"/>
+  <rect x="3" y="3" width="506" height="506" rx="113"
+        fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <!-- 圆角几何 N -->
+  <path d="M 164 376 L 164 136 L 348 376 L 348 136"
+        fill="none"
+        stroke="url(#fg)"
+        stroke-width="56"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        filter="url(#nShadow)"/>
+</svg>
