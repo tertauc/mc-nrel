@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::config::{Config, LoginMode};
 use crate::manifest::VersionManifest;
 use crate::mirror::MirrorKind;
-use crate::ui::Ui;
+use crate::ui::{Ui, UiEvent};
 
 const MAIN_MENU: [&str; 6] = [
     "启动游戏",
@@ -117,8 +117,8 @@ fn run(ui: &mut Ui) -> Result<()> {
         let Some(index) = menu_loop(
             ui,
             "Minecraft 启动器",
-            "↑↓ 选择，Enter 确认，Esc 退出",
-            "↑↓ 选择    Enter 确认    Esc 退出",
+            "↑↓/滚轮 选择，Enter/点击 确认，Esc 退出",
+            "↑↓/滚轮 选择    Enter/点击 确认    Esc 退出",
             &rows,
             &items,
             selected,
@@ -220,12 +220,17 @@ fn menu_loop(
         ui.footer(hint)?;
         ui.flush()?;
 
-        match ui.key()?.code {
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(items.len().saturating_sub(1)),
-            KeyCode::Enter => return Ok(Some(selected)),
-            KeyCode::Esc => return Ok(None),
-            _ => {}
+        match ui.wait()? {
+            UiEvent::Key(key) => match key.code {
+                KeyCode::Up => selected = ui::cycle_step(selected, items.len(), -1),
+                KeyCode::Down => selected = ui::cycle_step(selected, items.len(), 1),
+                KeyCode::Enter => return Ok(Some(selected)),
+                KeyCode::Esc => return Ok(None),
+                _ => {}
+            },
+            UiEvent::Click(index) => return Ok(Some(index)),
+            UiEvent::ScrollUp => selected = ui::cycle_step(selected, items.len(), -1),
+            UiEvent::ScrollDown => selected = ui::cycle_step(selected, items.len(), 1),
         }
     }
 }
@@ -601,14 +606,16 @@ fn choose_version(
             ui.blank()?;
             ui.line(&format!("  已选 {} · {} · {status}", row.id, row.kind))?;
         }
-        ui.footer("↑↓ 选择    Enter 选择并启动    F1/F2 快捷启动    Tab 切换    Esc 返回")?;
+        ui.footer(
+            "↑↓/滚轮 选择    Enter/点击 选择并启动    F1/F2 快捷启动    Tab 切换    Esc 返回",
+        )?;
         ui.flush()?;
 
-        // 等待按键期间让筛选框的光标闪烁，只重绘筛选行。
-        let key = loop {
-            if let Some(key) = ui.poll_key(ui::BLINK_INTERVAL)? {
+        // 等待输入期间让筛选框的光标闪烁，只重绘筛选行。
+        let event = loop {
+            if let Some(event) = ui.poll_event(ui::BLINK_INTERVAL)? {
                 blink = true;
-                break key;
+                break event;
             }
             blink = !blink;
             ui.rewrite_line(
@@ -621,46 +628,53 @@ fn choose_version(
             )?;
             ui.flush()?;
         };
-        match key.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::F(1) => return Ok(Some(manifest.latest.release.clone())),
-            KeyCode::F(2) => return Ok(Some(manifest.latest.snapshot.clone())),
-            KeyCode::Enter => {
-                if let Some(&index) = visible.get(selected) {
-                    return Ok(Some(rows[index].id.clone()));
+
+        let mut confirm = false;
+        match event {
+            UiEvent::Click(index) => {
+                selected = index;
+                confirm = true;
+            }
+            UiEvent::ScrollUp => selected = ui::cycle_step(selected, visible.len(), -1),
+            UiEvent::ScrollDown => selected = ui::cycle_step(selected, visible.len(), 1),
+            UiEvent::Key(key) => match key.code {
+                KeyCode::Esc => return Ok(None),
+                KeyCode::F(1) => return Ok(Some(manifest.latest.release.clone())),
+                KeyCode::F(2) => return Ok(Some(manifest.latest.snapshot.clone())),
+                KeyCode::Enter => confirm = true,
+                KeyCode::Tab => {
+                    scope = scope.next();
+                    selected = 0;
+                    start = 0;
                 }
-            }
-            KeyCode::Tab => {
-                scope = scope.next();
-                selected = 0;
-                start = 0;
-            }
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => {
-                if !visible.is_empty() {
-                    selected = (selected + 1).min(visible.len() - 1);
+                KeyCode::Up => selected = ui::cycle_step(selected, visible.len(), -1),
+                KeyCode::Down => selected = ui::cycle_step(selected, visible.len(), 1),
+                KeyCode::PageUp => selected = selected.saturating_sub(10),
+                KeyCode::PageDown => {
+                    if !visible.is_empty() {
+                        selected = (selected + 10).min(visible.len() - 1);
+                    }
                 }
-            }
-            KeyCode::PageUp => selected = selected.saturating_sub(10),
-            KeyCode::PageDown => {
-                if !visible.is_empty() {
-                    selected = (selected + 10).min(visible.len() - 1);
+                KeyCode::Backspace => {
+                    filter.pop();
+                    selected = 0;
+                    start = 0;
                 }
-            }
-            KeyCode::Backspace => {
-                filter.pop();
-                selected = 0;
-                start = 0;
-            }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                filter.push(c);
-                selected = 0;
-                start = 0;
-            }
-            _ => {}
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    filter.push(c);
+                    selected = 0;
+                    start = 0;
+                }
+                _ => {}
+            },
+        }
+        if confirm
+            && let Some(&index) = visible.get(selected)
+        {
+            return Ok(Some(rows[index].id.clone()));
         }
     }
 }
@@ -691,8 +705,8 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
         let Some(index) = menu_loop(
             ui,
             "账户管理",
-            "↑↓ 选择   Enter 确认   Esc 返回",
-            "↑↓ 选择    Enter 确认    Esc 返回",
+            "↑↓/滚轮 选择   Enter/点击 确认   Esc 返回",
+            "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
             &rows,
             &items,
             selected,
@@ -798,8 +812,8 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
         let Some(index) = menu_loop(
             ui,
             "启动器设置",
-            "↑↓ 选择   Enter 修改   Esc 返回",
-            "↑↓ 选择    Enter 修改    Esc 返回",
+            "↑↓/滚轮 选择   Enter/点击 修改   Esc 返回",
+            "↑↓/滚轮 选择    Enter/点击 修改    Esc 返回",
             &[],
             &items,
             selected,

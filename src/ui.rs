@@ -4,7 +4,10 @@ use std::time::Duration;
 use anyhow::Result;
 use console::style;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
+};
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
@@ -20,6 +23,15 @@ pub type InputValidator<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 /// 光标闪烁周期。
 pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 等待用户输入时可能收到的事件。
+#[derive(Debug, Clone, Copy)]
+pub enum UiEvent {
+    Key(KeyEvent),
+    Click(usize),
+    ScrollUp,
+    ScrollDown,
+}
+
 pub struct Ui {
     out: Stdout,
     width: u16,
@@ -27,6 +39,8 @@ pub struct Ui {
     row: u16,
     /// 启动前的控制台代码页（Windows），退出时还原。
     codepage: Option<(u32, u32)>,
+    /// 当前画面中可点击的行与对应列表下标。
+    clicks: Vec<(u16, usize)>,
 }
 
 impl Ui {
@@ -36,6 +50,8 @@ impl Ui {
         enable_raw_mode()?;
         let mut out = std::io::stdout();
         execute!(out, EnterAlternateScreen, Hide)?;
+        // 部分终端不支持鼠标上报，失败时不影响启动。
+        let _ = execute!(out, EnableMouseCapture);
         let (width, height) = terminal::size()?;
         Ok(Self {
             out,
@@ -43,6 +59,7 @@ impl Ui {
             height,
             row: 0,
             codepage,
+            clicks: Vec::new(),
         })
     }
 
@@ -59,6 +76,7 @@ impl Ui {
         self.width = width;
         self.height = height;
         self.row = 0;
+        self.clicks.clear();
         queue!(self.out, Clear(ClearType::All), MoveTo(0, 0))?;
         Ok(())
     }
@@ -245,6 +263,7 @@ impl Ui {
                 ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;
+            self.clicks.push((self.row, index));
             self.row += 1;
         }
         Ok(())
@@ -296,6 +315,7 @@ impl Ui {
                 ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;
+            self.clicks.push((self.row, index));
             self.row += 1;
             row_index += 1;
         }
@@ -353,20 +373,50 @@ impl Ui {
         Ok(false)
     }
 
-    pub fn poll_key(&self, timeout: Duration) -> Result<Option<KeyEvent>> {
+    /// 阻塞等待一次有效输入（按键、点击列表项或滚轮）。
+    pub fn wait(&self) -> Result<UiEvent> {
+        loop {
+            if let Some(ui_event) = self.read_event()? {
+                return Ok(ui_event);
+            }
+        }
+    }
+
+    /// 在超时内等待一次有效输入；超时返回 `None`。
+    pub fn poll_event(&self, timeout: Duration) -> Result<Option<UiEvent>> {
         if !event::poll(timeout)? {
             return Ok(None);
         }
         loop {
-            match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => return Ok(Some(key)),
-                _ => {
-                    if !event::poll(Duration::from_millis(0))? {
-                        return Ok(None);
-                    }
-                }
+            if let Some(ui_event) = self.read_event()? {
+                return Ok(Some(ui_event));
+            }
+            if !event::poll(Duration::from_millis(0))? {
+                return Ok(None);
             }
         }
+    }
+
+    fn read_event(&self) -> Result<Option<UiEvent>> {
+        match event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(UiEvent::Key(key))),
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    Ok(self.click_index(mouse.row).map(UiEvent::Click))
+                }
+                MouseEventKind::ScrollUp => Ok(Some(UiEvent::ScrollUp)),
+                MouseEventKind::ScrollDown => Ok(Some(UiEvent::ScrollDown)),
+                _ => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn click_index(&self, row: u16) -> Option<usize> {
+        self.clicks
+            .iter()
+            .find(|(click_row, _)| *click_row == row)
+            .map(|(_, index)| *index)
     }
 
     /// 原地重写一行，用于光标闪烁时局部刷新。
@@ -489,11 +539,14 @@ impl Ui {
             )?;
             self.flush()?;
 
-            let Some(key) = self.poll_key(BLINK_INTERVAL)? else {
+            let Some(ui_event) = self.poll_event(BLINK_INTERVAL)? else {
                 blink = !blink;
                 continue;
             };
             blink = true;
+            let UiEvent::Key(key) = ui_event else {
+                continue;
+            };
 
             match key.code {
                 KeyCode::Esc => return Ok(None),
@@ -571,16 +624,20 @@ impl Ui {
                 start = selected;
             }
             self.list(items, selected, start, max_rows)?;
-            self.footer("↑↓ 选择    Enter 确认    Esc 返回")?;
+            self.footer("↑↓/滚轮 选择    Enter/点击 确认    Esc 返回")?;
             self.flush()?;
 
-            let key = self.key()?;
-            match key.code {
-                KeyCode::Up => selected = selected.saturating_sub(1),
-                KeyCode::Down => selected = (selected + 1).min(items.len() - 1),
-                KeyCode::Enter => return Ok(Some(selected)),
-                KeyCode::Esc => return Ok(None),
-                _ => {}
+            match self.wait()? {
+                UiEvent::Key(key) => match key.code {
+                    KeyCode::Up => selected = cycle_step(selected, items.len(), -1),
+                    KeyCode::Down => selected = cycle_step(selected, items.len(), 1),
+                    KeyCode::Enter => return Ok(Some(selected)),
+                    KeyCode::Esc => return Ok(None),
+                    _ => {}
+                },
+                UiEvent::Click(index) => return Ok(Some(index)),
+                UiEvent::ScrollUp => selected = cycle_step(selected, items.len(), -1),
+                UiEvent::ScrollDown => selected = cycle_step(selected, items.len(), 1),
             }
         }
     }
@@ -589,7 +646,7 @@ impl Ui {
 impl Drop for Ui {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.out, LeaveAlternateScreen, Show);
+        let _ = execute!(self.out, DisableMouseCapture, LeaveAlternateScreen, Show);
         let _ = self.out.flush();
         if let Some((input, output)) = self.codepage.take() {
             restore_codepage(input, output);
@@ -635,6 +692,21 @@ fn switch_to_utf8() -> Option<(u32, u32)> {
 
 #[cfg(not(windows))]
 fn restore_codepage(_input: u32, _output: u32) {}
+
+/// 列表上下移动，首尾循环。
+pub fn cycle_step(selected: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let selected = selected.min(len - 1);
+    if delta < 0 {
+        if selected == 0 { len - 1 } else { selected - 1 }
+    } else if selected + 1 >= len {
+        0
+    } else {
+        selected + 1
+    }
+}
 
 fn truncate(text: &str, max: usize) -> String {
     if max == 0 {
