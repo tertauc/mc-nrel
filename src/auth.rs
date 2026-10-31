@@ -347,10 +347,6 @@ fn field(value: &Value, keys: &[&str]) -> Result<String> {
     bail!("认证响应缺少字段：{}", keys.join("/"))
 }
 
-/// Azure 应用注册（新建应用）页面，用于自定义登录页显示的应用名称与图标。
-pub const APP_REGISTRATION_URL: &str =
-    "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/CreateApplicationBlade";
-
 /// 把文本写入系统剪贴板，返回是否成功。
 pub fn copy_to_clipboard(text: &str) -> bool {
     #[cfg(windows)]

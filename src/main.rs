@@ -1351,7 +1351,6 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
             "离线登录（自定义用户名）".to_string(),
             "微软登录（浏览器设备码）".to_string(),
             "退出微软账户".to_string(),
-            "微软应用（登录页名称与图标）".to_string(),
         ];
 
         let Some(index) = ({
@@ -1406,112 +1405,10 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
                     cfg.save()?;
                 }
             }
-            3 => {
-                ms_app_menu(ui, cfg)?;
-            }
             _ => {}
         }
     }
 }
-
-/// 微软登录页显示的应用名称与图标由 Azure 应用注册决定，这里管理对应的客户端 ID。
-fn ms_app_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
-    let mut selected = 0usize;
-    loop {
-        let custom = cfg
-            .ms_client_id
-            .as_ref()
-            .map(|id| id.trim().to_string())
-            .filter(|id| !id.is_empty());
-        let rows = vec![
-            (
-                "登录页显示",
-                if custom.is_some() {
-                    "自定义应用（你注册的名称与图标）".to_string()
-                } else {
-                    "Prism Launcher（内置公开应用）".to_string()
-                },
-            ),
-            ("客户端 ID", cfg.ms_client_id()),
-        ];
-        let items = vec![
-            "填写自定义客户端 ID".to_string(),
-            "打开 Azure 应用注册页面".to_string(),
-            "查看注册步骤".to_string(),
-            "恢复内置默认应用".to_string(),
-        ];
-
-        let Some(index) = ({
-            let env = CmdEnv { cfg: &*cfg };
-            menu_loop(
-                ui,
-                "微软应用",
-                "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
-                true,
-                &rows,
-                &items,
-                selected,
-                &env,
-            )
-        })?
-        else {
-            return Ok(());
-        };
-        selected = index;
-
-        match index {
-            0 => {
-                let current = custom.clone().unwrap_or_default();
-                let Some(value) = ui.input(
-                    "自定义微软客户端 ID",
-                    "Azure 应用注册页面里的“应用程序(客户端) ID”",
-                    &current,
-                    true,
-                    None,
-                )?
-                else {
-                    continue;
-                };
-                cfg.ms_client_id = if value.trim().is_empty() {
-                    None
-                } else {
-                    Some(value.trim().to_string())
-                };
-                cfg.save()?;
-                if cfg.ms_refresh_token.is_some() {
-                    ui.alert(
-                        "需要重新登录",
-                        "已更换微软应用。原有的登录令牌属于旧应用，请重新登录微软账户。",
-                    )?;
-                }
-            }
-            1 => auth::open_browser(auth::APP_REGISTRATION_URL),
-            2 => ui.notice("注册自定义微软应用", APP_REGISTRATION_STEPS)?,
-            3 => {
-                cfg.ms_client_id = None;
-                cfg.save()?;
-                if cfg.ms_refresh_token.is_some() {
-                    ui.alert(
-                        "需要重新登录",
-                        "已恢复内置应用。原有的登录令牌属于自定义应用，请重新登录微软账户。",
-                    )?;
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-const APP_REGISTRATION_STEPS: &str = "\
-登录微软账号时，授权页显示的应用名称和图标来自 Azure 应用注册，而不是启动器本身。\
-内置的是 Prism Launcher 的公开应用，因此会显示成 Prism Launcher。\n\
-想显示成你自己的名字和图标，注册一个自己的应用即可（免费，只需几分钟）：\n\
-1. 打开 Azure 门户，进入 Microsoft Entra ID → 应用注册 → 新注册，名称填写 NREL。\n\
-2. 帐户类型选择“任何组织目录中的帐户和个人 Microsoft 帐户”。\n\
-3. 注册完成后，在“身份验证”页底部把“允许公共客户端流”设为“是”（设备码登录需要）。\n\
-4. 在“品牌与属性”中上传你的图标（正方形 PNG 或 JPG），授权页就会显示它。\n\
-5. 复制“应用程序(客户端) ID”，回到上一步选择“填写自定义客户端 ID”粘贴进去。\n\
-不需要配置重定向 URI，也不需要 API 权限。";
 
 fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
     let mut selected = 0usize;
