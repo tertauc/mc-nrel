@@ -24,12 +24,11 @@ use crate::manifest::VersionManifest;
 use crate::mirror::MirrorKind;
 use crate::ui::{Ui, UiEvent};
 
-const MAIN_MENU: [&str; 6] = [
+const MAIN_MENU: [&str; 5] = [
     "启动游戏",
     "选择版本",
     "账户管理",
     "启动器设置",
-    "刷新版本列表",
     "退出",
 ];
 
@@ -138,8 +137,8 @@ fn run(ui: &mut Ui) -> Result<()> {
                 Some(manifest) => start_game(ui, &client, &mut cfg, manifest),
                 None => missing_manifest(ui),
             },
-            MainAction::Versions => match &manifest {
-                Some(manifest) => match choose_version(ui, &mut cfg, manifest)? {
+            MainAction::Versions => match manifest.as_mut() {
+                Some(manifest) => match choose_version(ui, &client, &mut cfg, manifest)? {
                     Some(id) => {
                         cfg.last_version = Some(id);
                         cfg.save()?;
@@ -267,7 +266,6 @@ fn action_at(index: usize) -> MainAction {
         1 => MainAction::Versions,
         2 => MainAction::Account,
         3 => MainAction::Settings,
-        4 => MainAction::Refresh,
         _ => MainAction::Exit,
     }
 }
@@ -754,13 +752,14 @@ fn collect_versions(root: &Path, manifest: &VersionManifest) -> Vec<VersionRow> 
 
 fn choose_version(
     ui: &mut Ui,
+    client: &Client,
     cfg: &mut Config,
-    manifest: &VersionManifest,
+    manifest: &mut VersionManifest,
 ) -> Result<Option<String>> {
     let root = cfg.game_dir();
     let current = current_version_id(cfg, manifest);
-    let rows = collect_versions(&root, manifest);
-    let installed_count = rows.iter().filter(|row| row.installed).count();
+    let mut rows = collect_versions(&root, manifest);
+    let mut refreshed = false;
 
     let mut filter = String::new();
     let mut scope = VersionScope::All;
@@ -817,9 +816,10 @@ fn choose_version(
             })
             .collect();
 
+        let installed_count = rows.iter().filter(|row| row.installed).count();
         ui.header(
             "版本选择",
-            "F1 最新正式版    F2 最新快照    Tab 切换范围    Enter/点击 选择并启动    Esc 返回",
+            "F1 最新正式版    F2 最新快照    F5 刷新列表    Tab 切换范围    Enter/点击 选择并启动    Esc 返回",
         )?;
         ui.card(
             "快捷启动",
@@ -852,10 +852,11 @@ fn choose_version(
         }
         ui.list(&items, selected, start, max_rows)?;
         ui.dim_line(&format!(
-            "  共 {} 个版本 · 已安装 {} 个 · 当前显示 {} 个",
+            "  共 {} 个版本 · 已安装 {} 个 · 当前显示 {} 个{}",
             rows.len(),
             installed_count,
-            visible.len()
+            visible.len(),
+            if refreshed { " · 已刷新" } else { "" }
         ))?;
         if let Some(&index) = visible.get(selected) {
             let row = &rows[index];
@@ -870,7 +871,7 @@ fn choose_version(
             ui.line(&format!("  已选 {} · {} · {status}", row.id, row.kind))?;
         }
         ui.footer(
-            "↑↓/滚轮 选择    Enter/点击 选择并启动    F1/F2 快捷启动    Tab 切换    Esc 返回",
+            "↑↓/滚轮 选择    Enter/点击 选择并启动    F1/F2 快捷启动    F5 刷新    Tab 切换    Esc 返回",
             true,
         )?;
         ui.flush()?;
@@ -894,6 +895,7 @@ fn choose_version(
         };
 
         let mut confirm = false;
+        refreshed = false;
         match event {
             UiEvent::Click(index) => {
                 selected = index;
@@ -907,6 +909,26 @@ fn choose_version(
                 KeyCode::Esc => return Ok(None),
                 KeyCode::F(1) => return Ok(Some(manifest.latest.release.clone())),
                 KeyCode::F(2) => return Ok(Some(manifest.latest.snapshot.clone())),
+                KeyCode::F(5) => {
+                    match refresh_manifest(ui, client, cfg) {
+                        Ok(fresh) => {
+                            *manifest = fresh;
+                            rows = collect_versions(&root, manifest);
+                            let current = current_version_id(cfg, manifest);
+                            selected = rows
+                                .iter()
+                                .position(|row| row.id == current)
+                                .unwrap_or(0);
+                            start = 0;
+                            refreshed = true;
+                        }
+                        Err(err) => {
+                            logs::error(format!("刷新版本列表失败：{err:#}"));
+                            ui.alert("刷新版本列表失败", &format!("{err:#}"))?;
+                        }
+                    }
+                    continue;
+                }
                 KeyCode::Enter => confirm = true,
                 KeyCode::Tab => {
                     scope = scope.next();
