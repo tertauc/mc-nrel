@@ -10,7 +10,8 @@ use crate::mirror::MirrorKind;
 use crate::net;
 
 const CACHE_FILE: &str = "version_manifest_v2.json";
-const CACHE_TTL_SECS: u64 = 30 * 60;
+/// 缓存有效期：6 小时内直接复用，避免每次启动都等待网络。
+const CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VersionManifest {
