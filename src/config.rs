@@ -26,6 +26,26 @@ impl LoginMode {
     }
 }
 
+/// 日志记录等级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    /// 仅记录信息级及以上。
+    #[default]
+    Info,
+    /// 记录全部日志（含调试细节）。
+    All,
+}
+
+impl LogLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Info => "信息及以上",
+            Self::All => "全部（含调试）",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -39,6 +59,8 @@ pub struct Config {
     pub game_dir: Option<String>,
     /// 每个版本使用独立的 `versions/<id>` 作为游戏目录。
     pub isolate_versions: bool,
+    /// 日志记录等级。
+    pub log_level: LogLevel,
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
@@ -63,6 +85,7 @@ impl Default for Config {
             mirror: MirrorKind::default(),
             game_dir: None,
             isolate_versions: true,
+            log_level: LogLevel::default(),
             width: 854,
             height: 480,
             fullscreen: false,

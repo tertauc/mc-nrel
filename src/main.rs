@@ -3,6 +3,7 @@ mod config;
 mod install;
 mod java;
 mod launch;
+mod logs;
 mod manifest;
 mod mirror;
 mod net;
@@ -18,7 +19,7 @@ use crossterm::style::Color;
 use reqwest::blocking::Client;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{Config, LoginMode};
+use crate::config::{Config, LogLevel, LoginMode};
 use crate::manifest::VersionManifest;
 use crate::mirror::MirrorKind;
 use crate::ui::{Ui, UiEvent};
@@ -94,6 +95,19 @@ fn run(ui: &mut Ui) -> Result<()> {
     let mut cfg = Config::load();
     let client = net::client()?;
 
+    // 每次启动创建独立的日志文件，放在 .nrel-cache 中。
+    if let Err(err) = logs::init(cfg.log_level) {
+        ui::warn(format!("日志初始化失败：{err:#}"));
+    }
+    logs::info(format!("工作目录：{}", config::work_dir().display()));
+    logs::info(format!(
+        "账户：{} | 下载源：{} | 游戏目录：{} | 版本隔离：{}",
+        cfg.account_label(),
+        cfg.mirror.label(),
+        cfg.game_dir().display(),
+        cfg.isolation_label()
+    ));
+
     let mut manifest = match load_manifest(ui, &client, &cfg, false) {
         Ok(manifest) => Some(manifest),
         Err(err) => {
@@ -116,6 +130,7 @@ fn run(ui: &mut Ui) -> Result<()> {
         let items: Vec<String> = MAIN_MENU.iter().map(|item| item.to_string()).collect();
         let mirror_before = cfg.mirror;
         let action = main_menu(ui, &rows, &items, &mut selected, &cfg)?;
+        logs::info(format!("执行操作：{}", action.label()));
         let result = match action {
             MainAction::Launch => match &manifest {
                 Some(manifest) => start_game(ui, &client, &mut cfg, manifest),
@@ -153,7 +168,10 @@ fn run(ui: &mut Ui) -> Result<()> {
                     }
                 }
             }
-            Err(err) => ui.alert("操作未完成", &format!("{err:#}"))?,
+            Err(err) => {
+                logs::error(format!("{err:#}"));
+                ui.alert("操作未完成", &format!("{err:#}"))?
+            }
         }
     }
 
@@ -169,6 +187,19 @@ enum MainAction {
     Settings,
     Refresh,
     Exit,
+}
+
+impl MainAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Launch => "启动游戏",
+            Self::Versions => "选择版本",
+            Self::Account => "账户管理",
+            Self::Settings => "启动器设置",
+            Self::Refresh => "刷新版本列表",
+            Self::Exit => "退出",
+        }
+    }
 }
 
 /// 执行一条命令后的结果。
@@ -268,6 +299,7 @@ fn command_mode(ui: &mut Ui, cfg: &Config) -> Result<Option<MainAction>> {
                 if buffer == "/" {
                     return Ok(None);
                 }
+                logs::detail(|| format!("执行命令：{buffer}"));
                 match run_command(ui, cfg, &buffer)? {
                     CommandOutcome::Action(action) => return Ok(Some(action)),
                     CommandOutcome::Close => return Ok(None),
@@ -349,7 +381,18 @@ fn load_manifest(ui: &mut Ui, client: &Client, cfg: &Config, force: bool) -> Res
     )?;
     ui.work_line("正在连接版本服务器…")?;
     ui.flush()?;
+    logs::info(format!(
+        "{}版本列表（下载源：{}）",
+        if force { "刷新" } else { "获取" },
+        cfg.mirror.label()
+    ));
     let (manifest, _) = manifest::fetch(client, cfg.mirror, force)?;
+    logs::info(format!(
+        "版本列表获取成功：共 {} 个版本，最新正式版 {}，最新快照 {}",
+        manifest.versions.len(),
+        manifest.latest.release,
+        manifest.latest.snapshot
+    ));
     Ok(manifest)
 }
 
@@ -422,6 +465,10 @@ fn overview_rows(cfg: &Config, manifest: Option<&VersionManifest>) -> Vec<(&'sta
     rows.push(("下载源", cfg.mirror.label().to_string()));
     rows.push(("游戏目录", cfg.game_dir().display().to_string()));
     rows.push(("版本隔离", cfg.isolation_label().to_string()));
+    let log_name = logs::path()
+        .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "不可用".to_string());
+    rows.push(("日志", log_name));
     rows
 }
 
@@ -469,6 +516,11 @@ fn start_game(
 
     let root = cfg.game_dir();
     let installed = install::is_version_installed(&root, &id);
+    logs::info(format!(
+        "准备启动版本 {id}（{}，隔离目录 {}）",
+        if installed { "已安装" } else { "需安装" },
+        cfg.version_game_dir(&id).display()
+    ));
     ui.begin_work(
         "准备启动 Minecraft",
         format!(
@@ -503,6 +555,10 @@ fn start_game(
         }
     };
     let required = launch::required_java_major(&version);
+    logs::info(format!(
+        "版本文件已就绪：{}（需要 Java {}）",
+        version.id, required
+    ));
 
     let java = match java::pick(cfg.java_path.as_deref(), required) {
         Ok(java) => java,
@@ -528,6 +584,12 @@ fn start_game(
         )?;
         return Ok(());
     }
+    logs::info(format!(
+        "Java 运行环境：{}（主版本 {}，版本需要 {}）",
+        java.path.display(),
+        java.major,
+        required
+    ));
 
     let Some(session) = ensure_session(ui, client, cfg)? else {
         return Ok(());
@@ -547,7 +609,7 @@ fn start_game(
             ("版本", version.id.clone()),
             ("Java", java.label()),
             ("内存", format!("{} MB", cfg.effective_memory_mb())),
-            ("窗口", window),
+            ("窗口", window.clone()),
             ("游戏目录", cfg.version_game_dir(&version.id).display().to_string()),
         ],
     )?;
@@ -557,6 +619,7 @@ fn start_game(
 
     // 首次启动前写好中文语言与无障碍设置，跳过欢迎引导界面。
     if let Err(err) = launch::prepare_options(cfg, &version) {
+        logs::error(format!("写入游戏初始设置失败：{err:#}"));
         ui::warn(format!("写入游戏初始设置失败：{err:#}"));
     }
 
@@ -565,13 +628,29 @@ fn start_game(
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    logs::detail(|| {
+        format!(
+            "Java 程序：{}，启动参数数量：{}",
+            java.path.display(),
+            command.get_args().count()
+        )
+    });
+    logs::info(format!(
+        "启动参数：版本 {}，内存 {} MB，窗口 {}，游戏目录 {}",
+        version.id,
+        cfg.effective_memory_mb(),
+        window,
+        cfg.version_game_dir(&version.id).display()
+    ));
     let mut child = command
         .spawn()
         .with_context(|| format!("无法启动 Java：{}", java.path.display()))?;
 
+    logs::info(format!("游戏进程已启动，PID {}", child.id()));
     ui.line(&format!("  游戏已启动（PID {}），等待退出…", child.id()))?;
     ui.flush()?;
     let status = child.wait().context("等待游戏进程时出错")?;
+    logs::info(format!("游戏进程退出：{status}"));
 
     // 游戏日志保留在屏幕上，只追加结果。
     println!();
@@ -958,6 +1037,11 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.isolation_label()
             ),
             format!(
+                "{}  {}",
+                pad_label("日志等级", 13),
+                cfg.log_level.label()
+            ),
+            format!(
                 "{}  {} × {}",
                 pad_label("窗口分辨率", 13),
                 cfg.width,
@@ -1075,6 +1159,28 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.save()?;
             }
             5 => {
+                let kinds = [LogLevel::Info, LogLevel::All];
+                let choices: Vec<String> =
+                    kinds.iter().map(|kind| kind.label().to_string()).collect();
+                let default = kinds
+                    .iter()
+                    .position(|kind| *kind == cfg.log_level)
+                    .unwrap_or(0);
+                let Some(choice) = ui.pick(
+                    "日志等级",
+                    "“信息及以上”记录关键流程；“全部”额外记录调试细节",
+                    &choices,
+                    default,
+                )?
+                else {
+                    continue;
+                };
+                cfg.log_level = kinds[choice];
+                logs::set_level(cfg.log_level);
+                logs::info(format!("日志等级切换为：{}", cfg.log_level.label()));
+                cfg.save()?;
+            }
+            6 => {
                 let Some(value) = ui.input(
                     "窗口分辨率",
                     "格式：854x480",
@@ -1091,7 +1197,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                     cfg.save()?;
                 }
             }
-            6 => {
+            7 => {
                 let choices = vec!["关闭".to_string(), "开启".to_string()];
                 let default = if cfg.fullscreen { 1 } else { 0 };
                 let Some(choice) = ui.pick("全屏模式", "启动游戏时是否全屏", &choices, default)?
@@ -1101,7 +1207,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.fullscreen = choice == 1;
                 cfg.save()?;
             }
-            7 => {
+            8 => {
                 let Some(value) = ui.input(
                     "额外 JVM 参数",
                     "例如 -XX:+UseG1GC，留空表示不使用",
@@ -1180,6 +1286,7 @@ fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opti
                 )?;
                 return Ok(None);
             }
+            logs::info(format!("使用离线账户：{name}"));
             Ok(Some(auth::Session::offline(&name)))
         }
         LoginMode::Microsoft => {
@@ -1190,6 +1297,7 @@ fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opti
             ) && cfg.ms_expires_at > now_secs()
                 && !token.is_empty()
             {
+                logs::info(format!("使用已保存的微软令牌：{name}"));
                 return Ok(Some(auth::Session {
                     username: name,
                     uuid,
@@ -1208,11 +1316,13 @@ fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opti
                 };
                 match refreshed {
                     Ok((tokens, session)) => {
+                        logs::info(format!("微软令牌刷新成功：{}", session.username));
                         store_ms_login(cfg, &tokens, &session);
                         cfg.save()?;
                         return Ok(Some(session));
                     }
                     Err(err) => {
+                        logs::error(format!("刷新微软令牌失败：{err:#}"));
                         ui.alert(
                             "微软登录需要重新验证",
                             &format!("{err:#}\n\n接下来会重新走一次设备码登录。"),
@@ -1229,6 +1339,7 @@ fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opti
 fn microsoft_login(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Option<auth::Session>> {
     let client_id = cfg.ms_client_id();
 
+    logs::info("开始微软设备码登录");
     ui.begin_work("微软登录", "正在申请设备代码…")?;
     ui.flush()?;
     let code = match auth::request_device_code(client, &client_id) {
@@ -1325,6 +1436,7 @@ fn store_ms_login(cfg: &mut Config, tokens: &auth::MsTokens, session: &auth::Ses
     cfg.ms_expires_at = now_secs() + MC_TOKEN_LIFETIME - 3600;
     cfg.ms_name = Some(session.username.clone());
     cfg.ms_uuid = Some(session.uuid.clone());
+    logs::info(format!("微软登录成功：{}（{}）", session.username, session.uuid));
 }
 
 fn now_secs() -> i64 {
