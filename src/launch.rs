@@ -1,12 +1,71 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::auth::Session;
 use crate::config::Config;
 use crate::install::{self, VersionJson};
 use crate::java::JavaInfo;
+
+/// 首次启动前写入 options.txt 的初始项：简体中文、关闭旁白与无障碍引导。
+///
+/// 只在该文件仍是“未完成首次引导”的状态时改动语言和旁白，
+/// 之后玩家在游戏里自行调整的设置不会被覆盖。
+pub fn prepare_options(cfg: &Config, version: &VersionJson) -> Result<()> {
+    let path = cfg.game_dir().join("options.txt");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = existing.lines().map(|line| line.to_string()).collect();
+
+    let onboard = lines
+        .iter()
+        .find(|line| line.starts_with("onboardAccessibility:"));
+    let first_run = match onboard {
+        Some(line) => line.ends_with(":true"),
+        None => !path.is_file(),
+    };
+
+    if first_run {
+        set_option(&mut lines, "lang", language_code(&version.id));
+        set_option(&mut lines, "narrator", "0");
+    }
+    set_option(&mut lines, "onboardAccessibility", "false");
+
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    if text != existing {
+        std::fs::write(&path, text)
+            .with_context(|| format!("无法写入 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// 1.13 之前的版本使用大写的地区代码（zh_CN）。
+fn language_code(version_id: &str) -> &'static str {
+    let lower = version_id.to_ascii_lowercase();
+    if lower.starts_with('a') || lower.starts_with('b') {
+        return "zh_CN";
+    }
+    if let Some(rest) = lower.strip_prefix("1.")
+        && let Some(minor) = rest.split('.').next()
+        && minor.parse::<u32>().is_ok_and(|minor| minor < 13)
+    {
+        return "zh_CN";
+    }
+    "zh_cn"
+}
+
+fn set_option(lines: &mut Vec<String>, key: &str, value: &str) {
+    let prefix = format!("{key}:");
+    let new_line = format!("{key}:{value}");
+    if let Some(line) = lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+        *line = new_line;
+    } else {
+        lines.push(new_line);
+    }
+}
 
 pub fn required_java_major(version: &VersionJson) -> u32 {
     version

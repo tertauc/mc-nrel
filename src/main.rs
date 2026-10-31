@@ -379,6 +379,11 @@ fn start_game(
     ui.line("  正在启动游戏进程…")?;
     ui.flush()?;
 
+    // 首次启动前写好中文语言与无障碍设置，跳过欢迎引导界面。
+    if let Err(err) = launch::prepare_options(cfg, &version) {
+        ui::warn(format!("写入游戏初始设置失败：{err:#}"));
+    }
+
     let mut command = launch::build_command(cfg, &java, &version, &session)?;
     command
         .stdin(Stdio::null())
