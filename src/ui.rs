@@ -1,4 +1,5 @@
 use std::io::{Stdout, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,10 +19,35 @@ use crossterm::terminal as terminal;
 use crossterm::{execute, queue};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::logs;
+
 pub type InputValidator<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 
 /// 光标闪烁周期。
 pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// 后台线程数量；大于 0 时终端输出改为只写日志，避免破坏全屏界面。
+static QUIET: AtomicUsize = AtomicUsize::new(0);
+
+pub fn quiet() -> bool {
+    QUIET.load(Ordering::SeqCst) > 0
+}
+
+/// 进入静默输出模式，作用域结束后自动恢复。
+pub struct QuietGuard;
+
+impl QuietGuard {
+    pub fn new() -> Self {
+        QUIET.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for QuietGuard {
+    fn drop(&mut self) {
+        QUIET.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// 等待用户输入时可能收到的事件。
 #[derive(Debug, Clone, Copy)]
@@ -617,6 +643,15 @@ impl Ui {
 
     /// 全屏错误/提示页，按键后返回。
     pub fn alert(&mut self, title: &str, message: &str) -> Result<()> {
+        self.message_page(title, message, Color::Grey)
+    }
+
+    /// 信息页：正文用青色，与错误提示区分开。
+    pub fn notice(&mut self, title: &str, message: &str) -> Result<()> {
+        self.message_page(title, message, Color::Cyan)
+    }
+
+    fn message_page(&mut self, title: &str, message: &str, color: Color) -> Result<()> {
         self.begin()?;
         self.print_line(
             "  NREL  ·  Minecraft Launcher",
@@ -634,7 +669,7 @@ impl Ui {
                 continue;
             }
             for line in wrap(paragraph, limit) {
-                self.print_line(&format!("  {line}"), Some(Color::Red), false, false)?;
+                self.print_line(&format!("  {line}"), Some(color), false, false)?;
             }
         }
         self.blank()?;
@@ -956,6 +991,10 @@ fn char_width_of(ch: Option<&char>) -> usize {
 }
 
 pub fn step(title: impl std::fmt::Display, detail: impl std::fmt::Display) {
+    if quiet() {
+        logs::info(format!("{title} {detail}"));
+        return;
+    }
     println!(
         "  {} {} {}",
         style("›").cyan().bold(),
@@ -964,11 +1003,11 @@ pub fn step(title: impl std::fmt::Display, detail: impl std::fmt::Display) {
     );
 }
 
-pub fn ok(message: impl std::fmt::Display) {
-    println!("  {} {}", style("✓").green().bold(), message);
-}
-
 pub fn warn(message: impl std::fmt::Display) {
+    if quiet() {
+        logs::info(message.to_string());
+        return;
+    }
     println!("  {} {}", style("!").yellow().bold(), style(message).yellow());
 }
 

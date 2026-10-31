@@ -11,6 +11,17 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use sha1::{Digest, Sha1};
 
+use crate::ui;
+
+/// 后台线程中隐藏进度条，避免与全屏界面互相干扰。
+fn progress(len: u64) -> ProgressBar {
+    if ui::quiet() {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(len)
+    }
+}
+
 pub fn client() -> Result<Client> {
     Client::builder()
         .user_agent(format!(
@@ -193,7 +204,7 @@ pub fn download_one(client: &Client, task: &DownloadTask, label: &str) -> Result
     if existing_is_ok(task) {
         return Ok(());
     }
-    let pb = ProgressBar::new(task.size.unwrap_or(0));
+    let pb = progress(task.size.unwrap_or(0));
     pb.set_style(file_style());
     pb.set_message(label.to_string());
     let result = download_retry(client, task, Some(&pb));
@@ -210,7 +221,7 @@ pub fn download_many(client: &Client, mut tasks: Vec<DownloadTask>, label: &str)
     }
 
     let total = tasks.len() as u64;
-    let pb = ProgressBar::new(total);
+    let pb = progress(total);
     pb.set_style(count_style());
     pb.set_message(label.to_string());
 
