@@ -13,7 +13,11 @@ use crate::java::JavaInfo;
 /// 只在该文件仍是“未完成首次引导”的状态时改动语言和旁白，
 /// 之后玩家在游戏里自行调整的设置不会被覆盖。
 pub fn prepare_options(cfg: &Config, version: &VersionJson) -> Result<()> {
-    let path = cfg.game_dir().join("options.txt");
+    let path = cfg.version_game_dir(&version.id).join("options.txt");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("无法创建目录 {}", parent.display()))?;
+    }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = existing.lines().map(|line| line.to_string()).collect();
 
@@ -126,10 +130,14 @@ pub fn build_command(
     let memory = cfg.effective_memory_mb();
     let min_memory = memory.min(1024);
 
+    let game_dir = cfg.version_game_dir(&version.id);
+    std::fs::create_dir_all(&game_dir)
+        .with_context(|| format!("无法创建游戏目录 {}", game_dir.display()))?;
+
     let mut vars: HashMap<&str, String> = HashMap::new();
     vars.insert("auth_player_name", session.username.clone());
     vars.insert("version_name", version.id.clone());
-    vars.insert("game_directory", root.display().to_string());
+    vars.insert("game_directory", game_dir.display().to_string());
     vars.insert("assets_root", assets_root.display().to_string());
     vars.insert("game_assets", game_assets.display().to_string());
     vars.insert("assets_index_name", assets_index.clone());

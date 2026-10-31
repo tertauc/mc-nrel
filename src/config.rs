@@ -37,6 +37,8 @@ pub struct Config {
     pub java_path: Option<String>,
     pub mirror: MirrorKind,
     pub game_dir: Option<String>,
+    /// 每个版本使用独立的 `versions/<id>` 作为游戏目录。
+    pub isolate_versions: bool,
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
@@ -60,6 +62,7 @@ impl Default for Config {
             java_path: None,
             mirror: MirrorKind::default(),
             game_dir: None,
+            isolate_versions: true,
             width: 854,
             height: 480,
             fullscreen: false,
@@ -97,6 +100,19 @@ impl Config {
             Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
             _ => default_game_dir(),
         }
+    }
+
+    /// 游戏实际使用的工作目录：开启版本隔离时为 `versions/<id>`。
+    pub fn version_game_dir(&self, version_id: &str) -> PathBuf {
+        if self.isolate_versions {
+            self.game_dir().join("versions").join(version_id)
+        } else {
+            self.game_dir()
+        }
+    }
+
+    pub fn isolation_label(&self) -> &'static str {
+        if self.isolate_versions { "开启" } else { "关闭" }
     }
 
     pub fn effective_memory_mb(&self) -> u64 {

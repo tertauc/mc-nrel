@@ -249,6 +249,7 @@ fn overview_rows(cfg: &Config, manifest: Option<&VersionManifest>) -> Vec<(&'sta
     rows.push(("内存", memory_label(cfg)));
     rows.push(("下载源", cfg.mirror.label().to_string()));
     rows.push(("游戏目录", cfg.game_dir().display().to_string()));
+    rows.push(("版本隔离", cfg.isolation_label().to_string()));
     rows
 }
 
@@ -309,7 +310,10 @@ fn start_game(
             }
         ),
     )?;
-    ui.work_line(&format!("游戏目录：{}", root.display()))?;
+    ui.work_line(&format!(
+        "游戏目录：{}",
+        cfg.version_game_dir(&id).display()
+    ))?;
     ui.work_line(&format!("下载源：{}", cfg.mirror.label()))?;
     ui.blank()?;
     ui.flush()?;
@@ -372,7 +376,7 @@ fn start_game(
             ("Java", java.label()),
             ("内存", format!("{} MB", cfg.effective_memory_mb())),
             ("窗口", window),
-            ("游戏目录", root.display().to_string()),
+            ("游戏目录", cfg.version_game_dir(&version.id).display().to_string()),
         ],
     )?;
     ui.blank()?;
@@ -765,6 +769,11 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.game_dir().display()
             ),
             format!(
+                "{}  {}",
+                pad_label("版本隔离", 13),
+                cfg.isolation_label()
+            ),
+            format!(
                 "{}  {} × {}",
                 pad_label("窗口分辨率", 13),
                 cfg.width,
@@ -867,6 +876,21 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.save()?;
             }
             4 => {
+                let choices = vec!["关闭".to_string(), "开启".to_string()];
+                let default = if cfg.isolate_versions { 1 } else { 0 };
+                let Some(choice) = ui.pick(
+                    "版本隔离",
+                    "开启后每个版本使用独立的 versions/<版本> 目录（存档、模组、设置各自分开）",
+                    &choices,
+                    default,
+                )?
+                else {
+                    continue;
+                };
+                cfg.isolate_versions = choice == 1;
+                cfg.save()?;
+            }
+            5 => {
                 let Some(value) = ui.input(
                     "窗口分辨率",
                     "格式：854x480",
@@ -883,7 +907,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                     cfg.save()?;
                 }
             }
-            5 => {
+            6 => {
                 let choices = vec!["关闭".to_string(), "开启".to_string()];
                 let default = if cfg.fullscreen { 1 } else { 0 };
                 let Some(choice) = ui.pick("全屏模式", "启动游戏时是否全屏", &choices, default)?
@@ -893,7 +917,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.fullscreen = choice == 1;
                 cfg.save()?;
             }
-            6 => {
+            7 => {
                 let Some(value) = ui.input(
                     "额外 JVM 参数",
                     "例如 -XX:+UseG1GC，留空表示不使用",
