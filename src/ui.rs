@@ -539,6 +539,53 @@ impl Ui {
         Ok(())
     }
 
+    /// 底部命令输入行（最后一行）。
+    pub fn prompt_line(&mut self, text: &str) -> Result<()> {
+        if self.height == 0 {
+            return Ok(());
+        }
+        let y = self.height - 1;
+        queue!(
+            self.out,
+            MoveTo(0, y),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            Print(truncate(text, self.width as usize)),
+            ResetColor,
+            SetAttribute(Attribute::Reset)
+        )?;
+        self.row = self.height;
+        Ok(())
+    }
+
+    /// 命令模式的状态/错误提示行（倒数第二行）。
+    pub fn status_line(&mut self, text: &str, error: bool) -> Result<()> {
+        if self.height < 2 {
+            return Ok(());
+        }
+        let y = self.height - 2;
+        queue!(
+            self.out,
+            MoveTo(0, y),
+            Clear(ClearType::CurrentLine),
+            SetForegroundColor(if error { Color::Red } else { Color::DarkGrey }),
+            Print(truncate(text, self.width as usize)),
+            ResetColor
+        )?;
+        Ok(())
+    }
+
+    /// 清除底部两行（命令模式退出时使用）。
+    pub fn clear_bottom(&mut self) -> Result<()> {
+        for y in [self.height.saturating_sub(2), self.height.saturating_sub(1)] {
+            if y < self.height {
+                queue!(self.out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn begin_work(
         &mut self,
         title: impl std::fmt::Display,

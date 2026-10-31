@@ -114,27 +114,14 @@ fn run(ui: &mut Ui) -> Result<()> {
         }
         let rows = overview_rows(&cfg, manifest.as_ref());
         let items: Vec<String> = MAIN_MENU.iter().map(|item| item.to_string()).collect();
-        let Some(index) = menu_loop(
-            ui,
-            "Minecraft 启动器",
-            "↑↓/滚轮 选择    Enter/点击 确认    Esc 退出",
-            false,
-            &rows,
-            &items,
-            selected,
-        )?
-        else {
-            break;
-        };
-        selected = index;
-
         let mirror_before = cfg.mirror;
-        let result = match index {
-            0 => match &manifest {
+        let action = main_menu(ui, &rows, &items, &mut selected, &cfg)?;
+        let result = match action {
+            MainAction::Launch => match &manifest {
                 Some(manifest) => start_game(ui, &client, &mut cfg, manifest),
                 None => missing_manifest(ui),
             },
-            1 => match &manifest {
+            MainAction::Versions => match &manifest {
                 Some(manifest) => match choose_version(ui, &mut cfg, manifest)? {
                     Some(id) => {
                         cfg.last_version = Some(id);
@@ -145,10 +132,10 @@ fn run(ui: &mut Ui) -> Result<()> {
                 },
                 None => missing_manifest(ui),
             },
-            2 => account_menu(ui, &client, &mut cfg),
-            3 => settings_menu(ui, &mut cfg),
-            4 => refresh_manifest(ui, &client, &cfg).map(|fresh| manifest = Some(fresh)),
-            _ => break,
+            MainAction::Account => account_menu(ui, &client, &mut cfg),
+            MainAction::Settings => settings_menu(ui, &mut cfg),
+            MainAction::Refresh => refresh_manifest(ui, &client, &cfg).map(|fresh| manifest = Some(fresh)),
+            MainAction::Exit => break,
         };
 
         match result {
@@ -171,6 +158,184 @@ fn run(ui: &mut Ui) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// 主菜单可触发的动作。
+#[derive(Clone, Copy)]
+enum MainAction {
+    Launch,
+    Versions,
+    Account,
+    Settings,
+    Refresh,
+    Exit,
+}
+
+/// 执行一条命令后的结果。
+enum CommandOutcome {
+    Action(MainAction),
+    /// 命令已处理，留在命令模式。
+    Stay,
+    /// 关闭命令模式，回到主界面。
+    Close,
+}
+
+const MAIN_HINT: &str =
+    "↑↓/滚轮 选择    Enter/点击 确认    / 命令    Esc 不可用，请选择“退出”";
+
+fn main_menu(
+    ui: &mut Ui,
+    card: &[(&str, String)],
+    items: &[String],
+    selected: &mut usize,
+    cfg: &Config,
+) -> Result<MainAction> {
+    loop {
+        if *selected >= items.len() {
+            *selected = 0;
+        }
+        ui.header("Minecraft 启动器", MAIN_HINT)?;
+        ui.card("", card)?;
+        ui.blank()?;
+        ui.menu(items, *selected)?;
+        ui.footer(MAIN_HINT, false)?;
+        ui.flush()?;
+
+        match ui.wait()? {
+            UiEvent::Key(key) => match key.code {
+                KeyCode::Up => *selected = ui::cycle_step(*selected, items.len(), -1),
+                KeyCode::Down => *selected = ui::cycle_step(*selected, items.len(), 1),
+                KeyCode::Enter => return Ok(action_at(*selected)),
+                KeyCode::Char('/')
+                    if !key
+                        .modifiers
+                        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let action = command_mode(ui, cfg)?;
+                    ui.clear_bottom()?;
+                    ui.flush()?;
+                    if let Some(action) = action {
+                        return Ok(action);
+                    }
+                }
+                _ => {}
+            },
+            UiEvent::Click(index) => return Ok(action_at(index)),
+            UiEvent::ScrollUp => *selected = ui::cycle_step(*selected, items.len(), -1),
+            UiEvent::ScrollDown => *selected = ui::cycle_step(*selected, items.len(), 1),
+            UiEvent::Back | UiEvent::Redraw => {}
+        }
+    }
+}
+
+fn action_at(index: usize) -> MainAction {
+    match index {
+        0 => MainAction::Launch,
+        1 => MainAction::Versions,
+        2 => MainAction::Account,
+        3 => MainAction::Settings,
+        4 => MainAction::Refresh,
+        _ => MainAction::Exit,
+    }
+}
+
+/// vim 风格的底部命令模式：按 `/` 唤起，删到连 `/` 都没有时自动退出。
+fn command_mode(ui: &mut Ui, cfg: &Config) -> Result<Option<MainAction>> {
+    let mut buffer = String::from("/");
+    let mut blink = true;
+    let mut error: Option<String> = None;
+
+    loop {
+        let caret = if blink { "▏" } else { " " };
+        ui.prompt_line(&format!("  {buffer}{caret}"))?;
+        match &error {
+            Some(message) => ui.status_line(&format!("  {message}"), true)?,
+            None => ui.status_line("  命令模式    Enter 执行    Esc 取消    /help 查看命令", false)?,
+        }
+        ui.flush()?;
+
+        let Some(event) = ui.poll_event(ui::BLINK_INTERVAL)? else {
+            blink = !blink;
+            continue;
+        };
+        blink = true;
+        let UiEvent::Key(key) = event else {
+            continue;
+        };
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Enter => {
+                if buffer == "/" {
+                    return Ok(None);
+                }
+                match run_command(ui, cfg, &buffer)? {
+                    CommandOutcome::Action(action) => return Ok(Some(action)),
+                    CommandOutcome::Close => return Ok(None),
+                    CommandOutcome::Stay => {
+                        error = Some(format!("未知命令：{buffer}（输入 /help 查看命令）"));
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                error = None;
+                if buffer.is_empty() {
+                    return Ok(None);
+                }
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                buffer.push(c);
+                error = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn run_command(ui: &mut Ui, cfg: &Config, command: &str) -> Result<CommandOutcome> {
+    match command.trim() {
+        "/quit" | "/q" | "/exit" => Ok(CommandOutcome::Action(MainAction::Exit)),
+        "/launch" | "/l" | "/play" => Ok(CommandOutcome::Action(MainAction::Launch)),
+        "/versions" | "/v" | "/select" => Ok(CommandOutcome::Action(MainAction::Versions)),
+        "/account" | "/a" => Ok(CommandOutcome::Action(MainAction::Account)),
+        "/settings" | "/s" => Ok(CommandOutcome::Action(MainAction::Settings)),
+        "/refresh" | "/r" => Ok(CommandOutcome::Action(MainAction::Refresh)),
+        "/help" | "/h" | "/?" => {
+            ui.alert(
+                "命令帮助",
+                "/help       显示本帮助\n\
+                 /quit       退出启动器（别名 /q、/exit）\n\
+                 /launch     启动当前版本（别名 /l）\n\
+                 /versions   打开版本选择（别名 /v）\n\
+                 /account    打开账户管理（别名 /a）\n\
+                 /settings   打开启动器设置（别名 /s）\n\
+                 /refresh    刷新版本列表（别名 /r）\n\
+                 /version    查看启动器版本与目录\n\
+                 /dir        查看游戏目录",
+            )?;
+            Ok(CommandOutcome::Close)
+        }
+        "/version" => {
+            ui.alert(
+                "版本信息",
+                &format!(
+                    "NREL 启动器 v{}\n游戏目录：{}",
+                    env!("CARGO_PKG_VERSION"),
+                    cfg.game_dir().display()
+                ),
+            )?;
+            Ok(CommandOutcome::Close)
+        }
+        "/dir" => {
+            ui.alert("游戏目录", &cfg.game_dir().display().to_string())?;
+            Ok(CommandOutcome::Close)
+        }
+        _ => Ok(CommandOutcome::Stay),
+    }
 }
 
 fn load_manifest(ui: &mut Ui, client: &Client, cfg: &Config, force: bool) -> Result<VersionManifest> {
