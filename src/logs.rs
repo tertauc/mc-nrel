@@ -16,12 +16,12 @@ static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// 是否记录“全部”（含调试）日志。
 static ALL: AtomicBool = AtomicBool::new(false);
 
-/// 创建本次运行的日志文件，文件名为 `YYYYMMdd-hh-mm-ss.log`。
+/// 创建本次运行的日志文件，文件名为 `YYYYMMdd-hh-mm-ss.log`，存放于 `.nrel-cache/logs`。
 ///
 /// Windows 文件名不允许出现冒号，因此时间部分用短横线分隔。
 pub fn init(level: LogLevel) -> Result<PathBuf> {
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).with_context(|| format!("无法创建缓存目录 {}", dir.display()))?;
+    let dir = cache_dir().join("logs");
+    fs::create_dir_all(&dir).with_context(|| format!("无法创建日志目录 {}", dir.display()))?;
     let (date, time) = now_parts();
     let stem = format!(
         "{date:08}-{:02}-{:02}-{:02}",

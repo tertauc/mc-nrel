@@ -40,6 +40,8 @@ struct VersionRow {
     date: String,
     installed: bool,
     local_only: bool,
+    /// 已安装时对应的版本文件夹名。
+    folder: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -714,25 +716,32 @@ fn choose_java(ui: &mut Ui, cfg: &mut Config, required: u32) -> Result<Option<ja
 }
 
 fn collect_versions(root: &Path, manifest: &VersionManifest) -> Vec<VersionRow> {
+    // 每次打开版本列表都重新扫描 versions 文件夹，确保已安装状态最新。
+    let locals = install::list_local_versions(root);
     let mut rows: Vec<VersionRow> = manifest
         .versions
         .iter()
-        .map(|entry| VersionRow {
-            id: entry.id.clone(),
-            kind: entry.kind_label().to_string(),
-            date: entry.date(),
-            installed: install::is_version_installed(root, &entry.id),
-            local_only: false,
+        .map(|entry| {
+            let local = locals.iter().find(|local| local.id == entry.id);
+            VersionRow {
+                id: entry.id.clone(),
+                kind: entry.kind_label().to_string(),
+                date: entry.date(),
+                installed: local.is_some_and(|local| local.installed),
+                local_only: false,
+                folder: local.map(|local| local.folder.clone()),
+            }
         })
         .collect();
 
-    for local in install::list_local_versions(root) {
+    for local in locals {
         if rows.iter().any(|row| row.id == local.id) {
             continue;
         }
         let kind = local.kind_label().to_string();
         rows.push(VersionRow {
-            installed: install::is_version_installed(root, &local.id),
+            installed: local.installed,
+            folder: Some(local.folder),
             id: local.id,
             kind,
             date: "本地文件".to_string(),
@@ -769,6 +778,10 @@ fn choose_version(
                 needle.is_empty()
                     || row.id.to_lowercase().contains(&needle)
                     || row.kind.contains(&filter)
+                    || row
+                        .folder
+                        .as_ref()
+                        .is_some_and(|folder| folder.to_lowercase().contains(&needle))
             })
             .map(|(index, _)| index)
             .collect();
@@ -784,6 +797,10 @@ fn choose_version(
             .map(|&index| {
                 let row = &rows[index];
                 let marker = if row.installed { "●" } else { "○" };
+                let name = match (&row.folder, row.installed) {
+                    (Some(folder), true) => format!("{}（{}）", row.id, folder),
+                    _ => row.id.clone(),
+                };
                 let mut suffix = String::new();
                 if row.local_only {
                     suffix.push_str("  ◆ 本地");
@@ -793,7 +810,7 @@ fn choose_version(
                 }
                 format!(
                     "{marker} {}  {}  {}{suffix}",
-                    pad_label(&row.id, 24),
+                    pad_label(&name, 24),
                     pad_label(&row.kind, 10),
                     row.date
                 )

@@ -317,8 +317,13 @@ pub fn is_version_installed(root: &Path, id: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct LocalVersion {
+    /// 版本 JSON 中声明的版本号。
     pub id: String,
+    /// `versions` 下的文件夹名。
+    pub folder: String,
     pub kind: String,
+    /// JSON 与同名 jar 均存在时视为已安装。
+    pub installed: bool,
 }
 
 impl LocalVersion {
@@ -350,19 +355,31 @@ pub fn list_local_versions(root: &Path) -> Vec<LocalVersion> {
         if !path.is_dir() {
             continue;
         }
-        let id = entry.file_name().to_string_lossy().to_string();
-        let Ok(text) = fs::read_to_string(path.join(format!("{id}.json"))) else {
+        let folder = entry.file_name().to_string_lossy().to_string();
+        let Ok(text) = fs::read_to_string(path.join(format!("{folder}.json"))) else {
             continue;
         };
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
+        let id = value
+            .get("id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&folder)
+            .to_string();
         let kind = value
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string();
-        versions.push(LocalVersion { id, kind });
+        let installed = path.join(format!("{folder}.jar")).is_file();
+        versions.push(LocalVersion {
+            id,
+            folder,
+            kind,
+            installed,
+        });
     }
 
     versions.sort_by_key(|version| version.id.to_lowercase());

@@ -102,10 +102,13 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        match fs::read_to_string(Self::path()) {
+        let cfg = match fs::read_to_string(Self::path()) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Self::default(),
-        }
+        };
+        // 无论配置是否被修改，启动时都生成配置文件。
+        let _ = cfg.save();
+        cfg
     }
 
     pub fn save(&self) -> Result<()> {
