@@ -1,5 +1,4 @@
 use std::io::{Stdout, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -19,35 +18,10 @@ use crossterm::terminal as terminal;
 use crossterm::{execute, queue};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::logs;
-
 pub type InputValidator<'a> = &'a dyn Fn(&str) -> Result<(), String>;
 
 /// 光标闪烁周期。
 pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
-
-/// 后台线程数量；大于 0 时终端输出改为只写日志，避免破坏全屏界面。
-static QUIET: AtomicUsize = AtomicUsize::new(0);
-
-pub fn quiet() -> bool {
-    QUIET.load(Ordering::SeqCst) > 0
-}
-
-/// 进入静默输出模式，作用域结束后自动恢复。
-pub struct QuietGuard;
-
-impl QuietGuard {
-    pub fn new() -> Self {
-        QUIET.fetch_add(1, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for QuietGuard {
-    fn drop(&mut self) {
-        QUIET.fetch_sub(1, Ordering::SeqCst);
-    }
-}
 
 /// 等待用户输入时可能收到的事件。
 #[derive(Debug, Clone, Copy)]
@@ -991,10 +965,6 @@ fn char_width_of(ch: Option<&char>) -> usize {
 }
 
 pub fn step(title: impl std::fmt::Display, detail: impl std::fmt::Display) {
-    if quiet() {
-        logs::info(format!("{title} {detail}"));
-        return;
-    }
     println!(
         "  {} {} {}",
         style("›").cyan().bold(),
@@ -1004,10 +974,6 @@ pub fn step(title: impl std::fmt::Display, detail: impl std::fmt::Display) {
 }
 
 pub fn warn(message: impl std::fmt::Display) {
-    if quiet() {
-        logs::info(message.to_string());
-        return;
-    }
     println!("  {} {}", style("!").yellow().bold(), style(message).yellow());
 }
 

@@ -143,11 +143,7 @@ fn run(ui: &mut Ui) -> Result<()> {
         let action = match pending.or_else(|| active_screen().action()) {
             Some(action) => action,
             None => {
-                let env = CmdEnv {
-                    cfg: &cfg,
-                    client: &client,
-                    manifest: manifest.as_ref(),
-                };
+                let env = CmdEnv { cfg: &cfg };
                 match main_menu(ui, &rows, &items, &mut selected, &env)? {
                     Some(action) => action,
                     // 切换线程等操作需要重新按当前线程的界面状态路由。
@@ -158,18 +154,7 @@ fn run(ui: &mut Ui) -> Result<()> {
         logs::info(format!("执行操作：{}", action.label()));
         let result = match action {
             MainAction::Launch => match &manifest {
-                Some(manifest) => {
-                    set_screen(ThreadScreen::Main);
-                    let env = CmdEnv {
-                        cfg: &cfg,
-                        client: &client,
-                        manifest: Some(manifest),
-                    };
-                    match spawn_and_new_thread(&env) {
-                        Ok(message) => ui.notice("后台启动", &message),
-                        Err(err) => ui.alert("启动失败", &format!("{err:#}")),
-                    }
-                }
+                Some(manifest) => start_game(ui, &client, &mut cfg, manifest),
                 None => missing_manifest(ui),
             },
             MainAction::Versions => match manifest.as_mut() {
@@ -180,16 +165,7 @@ fn run(ui: &mut Ui) -> Result<()> {
                         Some(id) => {
                             cfg.last_version = Some(id);
                             cfg.save()?;
-                            set_screen(ThreadScreen::Main);
-                            let env = CmdEnv {
-                                cfg: &cfg,
-                                client: &client,
-                                manifest: Some(&*manifest),
-                            };
-                            match spawn_and_new_thread(&env) {
-                                Ok(message) => ui.notice("后台启动", &message),
-                                Err(err) => ui.alert("启动失败", &format!("{err:#}")),
-                            }
+                            start_game(ui, &client, &mut cfg, &*manifest)
                         }
                         None => Ok(()),
                     };
@@ -204,7 +180,7 @@ fn run(ui: &mut Ui) -> Result<()> {
             MainAction::Account => {
                 let owner = ACTIVE_THREAD.load(Ordering::SeqCst);
                 set_screen(ThreadScreen::Account);
-                let result = account_menu(ui, &client, &mut cfg, manifest.as_ref());
+                let result = account_menu(ui, &client, &mut cfg);
                 if ACTIVE_THREAD.load(Ordering::SeqCst) == owner {
                     set_screen_at(owner, ThreadScreen::Main);
                 }
@@ -213,7 +189,7 @@ fn run(ui: &mut Ui) -> Result<()> {
             MainAction::Settings => {
                 let owner = ACTIVE_THREAD.load(Ordering::SeqCst);
                 set_screen(ThreadScreen::Settings);
-                let result = settings_menu(ui, &client, &mut cfg, manifest.as_ref());
+                let result = settings_menu(ui, &mut cfg);
                 if ACTIVE_THREAD.load(Ordering::SeqCst) == owner {
                     set_screen_at(owner, ThreadScreen::Main);
                 }
@@ -290,8 +266,6 @@ enum CommandResult {
 /// 供命令处理使用的应用上下文。
 struct CmdEnv<'a> {
     cfg: &'a Config,
-    client: &'a Client,
-    manifest: Option<&'a VersionManifest>,
 }
 
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -375,6 +349,22 @@ fn active_screen() -> ThreadScreen {
         .get(active)
         .map(|thread| thread.screen)
         .unwrap_or(ThreadScreen::Main)
+}
+
+fn set_thread_status(status: String) {
+    let active = ACTIVE_THREAD.load(Ordering::SeqCst);
+    if let Some(thread) = THREADS.lock().unwrap().get(active) {
+        *thread.status.lock().unwrap() = status;
+    }
+}
+
+fn thread_status_arc() -> Option<Arc<Mutex<String>>> {
+    let active = ACTIVE_THREAD.load(Ordering::SeqCst);
+    THREADS
+        .lock()
+        .unwrap()
+        .get(active)
+        .map(|thread| Arc::clone(&thread.status))
 }
 
 fn thread_status(index: usize) -> String {
@@ -636,7 +626,7 @@ fn dispatch_command(
                 "/help       显示本帮助\n\
                  /quit       退出启动器（别名 /q、/exit）\n\
                  /main       返回主界面\n\
-                 /launch     后台启动当前版本并新建线程（别名 /l）\n\
+                 /launch     启动当前版本（别名 /l）\n\
                  /versions   打开版本选择（别名 /v）\n\
                  /account    打开账户管理（别名 /a）\n\
                  /settings   打开启动器设置（别名 /s）\n\
@@ -725,136 +715,12 @@ fn dispatch_command(
             ui.alert(
                 "未知命令",
                 &format!(
-                    "{cmd}\n\n输入 /help 查看可用命令。启动游戏默认后台运行，直接使用 /launch。"
+                    "{cmd}\n\n输入 /help 查看可用命令。",
                 ),
             )?;
         }
     }
     Ok(CommandResult::Handled)
-}
-
-/// 在当前线程中于后台安装并启动游戏，不阻塞界面。
-fn spawn_background_launch(env: &CmdEnv) -> Result<String> {
-    let Some(manifest) = env.manifest else {
-        bail!("尚未获取版本列表，请先刷新");
-    };
-    // 先做一次会话检查，避免带着必然失败的任务切走。
-    silent_session(env.cfg)?;
-    let cfg = env.cfg.clone();
-    let manifest = manifest.clone();
-    let client = env.client.clone();
-    let active = ACTIVE_THREAD.load(Ordering::SeqCst);
-    let id = current_version_id(&cfg, &manifest);
-    let status = {
-        let list = THREADS.lock().unwrap();
-        let Some(thread) = list.get(active) else {
-            bail!("线程 {} 不存在", active + 1);
-        };
-        Arc::clone(&thread.status)
-    };
-    *status.lock().unwrap() = format!("启动中：{id}");
-
-    let thread_no = active + 1;
-    let handle = std::thread::spawn(move || {
-        let _quiet = ui::QuietGuard::new();
-        let result = background_launch(&cfg, &manifest, &client, &status);
-        let text = match result {
-            Ok(text) => text,
-            Err(err) => format!("失败：{err:#}"),
-        };
-        logs::info(format!("线程 {thread_no}：{text}"));
-        *status.lock().unwrap() = text;
-    });
-    THREADS.lock().unwrap()[active].handle = Some(handle);
-
-    Ok(format!("线程 {thread_no} 已在后台启动版本 {id}。\n使用 /thread 查看状态，用 /thread N 切换线程。"))
-}
-
-/// 默认启动方式：游戏转入后台，同时新建一个线程并切到它的主界面。
-fn spawn_and_new_thread(env: &CmdEnv) -> Result<String> {
-    let previous = ACTIVE_THREAD.load(Ordering::SeqCst);
-    let message = spawn_background_launch(env)?;
-    // 原线程留在主界面，游戏在它自己的线程里继续运行。
-    set_screen_at(previous, ThreadScreen::Main);
-    let index = create_thread();
-    logs::info(format!("已自动创建线程 {} 并显示主界面", index + 1));
-    Ok(format!(
-        "{message}\n\n已自动创建线程 {} 并切换到主界面。",
-        index + 1
-    ))
-}
-
-/// 后台线程内的启动流程，不触碰全屏界面。
-fn background_launch(
-    cfg: &Config,
-    manifest: &VersionManifest,
-    client: &Client,
-    status: &Arc<Mutex<String>>,
-) -> Result<String> {
-    let id = current_version_id(cfg, manifest);
-    let installed = install::is_version_installed(&cfg.game_dir(), &id);
-    let version = match manifest.find(&id) {
-        Some(entry) => install::ensure_installed(client, cfg, entry)?,
-        None => {
-            if !installed {
-                bail!("本地版本 {id} 缺少客户端 jar");
-            }
-            install::load_version_merged(&cfg.game_dir(), &id)
-                .with_context(|| format!("无法读取本地版本 {id}"))?
-        }
-    };
-    let required = launch::required_java_major(&version);
-    let java = java::pick(cfg.java_path.as_deref(), required)?;
-    if java.major < required {
-        bail!("Java 版本过低：需要 {required}，当前 {}", java.major);
-    }
-    let session = silent_session(cfg)?;
-    if let Err(err) = launch::prepare_options(cfg, &version) {
-        logs::error(format!("写入游戏初始设置失败：{err:#}"));
-    }
-    let mut command = launch::build_command(cfg, &java, &version, &session)?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("无法启动 Java：{}", java.path.display()))?;
-    let pid = child.id();
-    *status.lock().unwrap() = format!("运行中：{id}（PID {pid}）");
-    let code = child.wait().context("等待游戏进程时出错")?;
-    Ok(format!("游戏已退出：{id}（{code}）"))
-}
-
-/// 后台启动时使用不弹窗的会话：离线账户或已保存且有效的微软令牌。
-fn silent_session(cfg: &Config) -> Result<auth::Session> {
-    match cfg.login_mode {
-        LoginMode::Offline => {
-            let name = cfg.username.trim();
-            if name.is_empty() {
-                bail!("还没有离线用户名");
-            }
-            Ok(auth::Session::offline(name))
-        }
-        LoginMode::Microsoft => {
-            if let (Some(token), Some(name), Some(uuid)) = (
-                cfg.ms_access_token.clone(),
-                cfg.ms_name.clone(),
-                cfg.ms_uuid.clone(),
-            ) && cfg.ms_expires_at > now_secs()
-                && !token.is_empty()
-            {
-                Ok(auth::Session {
-                    username: name,
-                    uuid,
-                    access_token: token,
-                    user_type: "msa".to_string(),
-                })
-            } else {
-                bail!("微软令牌已过期，请先在主界面完成登录")
-            }
-        }
-    }
 }
 
 fn load_manifest(ui: &mut Ui, client: &Client, cfg: &Config, force: bool) -> Result<VersionManifest> {
@@ -996,8 +862,7 @@ fn java_label(cfg: &Config) -> String {
     }
 }
 
-/// 旧的同步启动流程，保留给交互式登录流程复用。
-#[allow(dead_code)]
+/// 前台启动：安装与启动过程在当前线程界面展示，启动后回到界面并显示运行状态。
 fn start_game(
     ui: &mut Ui,
     client: &Client,
@@ -1005,8 +870,10 @@ fn start_game(
     manifest: &VersionManifest,
 ) -> Result<()> {
     let id = current_version_id(cfg, manifest);
+    set_thread_status(format!("启动中：{id}"));
 
     if cfg.login_mode == LoginMode::Offline && cfg.username.trim().is_empty() {
+        set_thread_status("空闲".to_string());
         ui.alert(
             "还没有离线用户名",
             "请先在“账户管理”中设置用户名，或登录微软账户。",
@@ -1054,7 +921,10 @@ fn start_game(
             )?;
             match choose_java(ui, cfg, required)? {
                 Some(java) => java,
-                None => return Ok(()),
+                None => {
+                    set_thread_status("空闲".to_string());
+                    return Ok(());
+                }
             }
         }
     };
@@ -1067,6 +937,7 @@ fn start_game(
                 java.major
             ),
         )?;
+        set_thread_status("空闲".to_string());
         return Ok(());
     }
     logs::info(format!(
@@ -1077,6 +948,7 @@ fn start_game(
     ));
 
     let Some(session) = ensure_session(ui, client, cfg)? else {
+        set_thread_status("空闲".to_string());
         return Ok(());
     };
 
@@ -1123,23 +995,25 @@ fn start_game(
         .spawn()
         .with_context(|| format!("无法启动 Java：{}", java.path.display()))?;
 
-    logs::info(format!("游戏进程已启动，PID {}", child.id()));
-    ui.line(&format!("  游戏已启动（PID {}），等待退出…", child.id()))?;
-    ui.flush()?;
-    let status = child.wait().context("等待游戏进程时出错")?;
-    logs::info(format!("游戏进程退出：{status}"));
-
-    // 返回启动器界面，只显示一行结果。
-    ui.begin()?;
-    if status.success() {
-        ui.line("  游戏已正常退出")?;
-    } else {
-        ui.line(&format!("  游戏进程结束：{status}"))?;
+    let pid = child.id();
+    logs::info(format!("游戏进程已启动，PID {pid}"));
+    set_thread_status(format!("运行中：{}（PID {pid}）", version.id));
+    // 在后台等待进程退出，让线程状态能及时恢复为空闲。
+    if let Some(status) = thread_status_arc() {
+        std::thread::spawn(move || {
+            if let Ok(code) = child.wait() {
+                logs::info(format!("游戏进程退出：{code}"));
+                *status.lock().unwrap() = format!("空闲（{} 已退出）", code);
+            }
+        });
     }
-    ui.blank()?;
-    ui.line("  按任意键返回主菜单…")?;
-    ui.flush()?;
-    ui.wait_key()
+    ui.notice(
+        "游戏运行中",
+        &format!(
+            "版本 {} 正在运行（PID {pid}）。\n\n启动器已回到界面，可继续使用 / 命令（/thread 查看线程状态）。",
+            version.id
+        ),
+    )
 }
 
 fn choose_java(ui: &mut Ui, cfg: &mut Config, required: u32) -> Result<Option<java::JavaInfo>> {
@@ -1375,11 +1249,7 @@ fn choose_version(
         if let Some(result) = maybe_command(
             ui,
             &event,
-            &CmdEnv {
-                cfg: &*cfg,
-                client,
-                manifest: Some(&*manifest),
-            },
+            &CmdEnv { cfg: &*cfg },
             false,
         )? {
             if matches!(result, CommandResult::Main | CommandResult::Quit) {
@@ -1461,12 +1331,7 @@ fn choose_version(
     }
 }
 
-fn account_menu(
-    ui: &mut Ui,
-    client: &Client,
-    cfg: &mut Config,
-    manifest: Option<&VersionManifest>,
-) -> Result<()> {
+fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let rows = vec![
@@ -1490,11 +1355,7 @@ fn account_menu(
         ];
 
         let Some(index) = ({
-            let env = CmdEnv {
-                cfg: &*cfg,
-                client,
-                manifest,
-            };
+            let env = CmdEnv { cfg: &*cfg };
             menu_loop(
                 ui,
                 "账户管理",
@@ -1565,12 +1426,7 @@ fn account_menu(
     }
 }
 
-fn settings_menu(
-    ui: &mut Ui,
-    client: &Client,
-    cfg: &mut Config,
-    manifest: Option<&VersionManifest>,
-) -> Result<()> {
+fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let items = vec![
@@ -1615,11 +1471,7 @@ fn settings_menu(
         ];
 
         let Some(index) = ({
-            let env = CmdEnv {
-                cfg: &*cfg,
-                client,
-                manifest,
-            };
+            let env = CmdEnv { cfg: &*cfg };
             menu_loop(
                 ui,
                 "启动器设置",

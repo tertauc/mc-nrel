@@ -11,15 +11,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use sha1::{Digest, Sha1};
 
-use crate::ui;
-
-/// 后台线程中隐藏进度条，避免与全屏界面互相干扰。
 fn progress(len: u64) -> ProgressBar {
-    if ui::quiet() {
-        ProgressBar::hidden()
-    } else {
-        ProgressBar::new(len)
-    }
+    ProgressBar::new(len)
 }
 
 pub fn client() -> Result<Client> {
