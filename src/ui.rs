@@ -51,6 +51,8 @@ pub struct Ui {
     back_row: Option<u16>,
     /// 鼠标是否悬停在“返回”按钮上。
     hover_back: bool,
+    /// 底部提示行绘制前的正文结束行，用于清除正文与底栏之间的残留。
+    gap_start: Option<u16>,
 }
 
 impl Ui {
@@ -73,6 +75,7 @@ impl Ui {
             hover: None,
             back_row: None,
             hover_back: false,
+            gap_start: None,
         })
     }
 
@@ -92,6 +95,7 @@ impl Ui {
         self.row = 0;
         self.clicks.clear();
         self.back_row = None;
+        self.gap_start = None;
         if resized {
             queue!(self.out, Clear(ClearType::All), MoveTo(0, 0))?;
         } else {
@@ -102,11 +106,13 @@ impl Ui {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        // 清掉本帧没有用到的残留行。
-        let mut row = self.row;
-        while row < self.height {
+        // 清掉本帧没有用到的残留行：有底栏时只清正文与底栏之间的部分。
+        let (start, end) = match self.gap_start.take() {
+            Some(start) => (start.min(self.height), self.height.saturating_sub(1)),
+            None => (self.row.min(self.height), self.height),
+        };
+        for row in start..end {
             queue!(self.out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-            row += 1;
         }
         self.out.flush()?;
         Ok(())
@@ -413,6 +419,8 @@ impl Ui {
             )?;
             self.back_row = Some(y);
         }
+        // 记录正文结束行，供 flush 清除正文与底栏之间的残留。
+        self.gap_start = Some(self.row);
         if self.row < self.height {
             self.row = self.height;
         }
