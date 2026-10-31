@@ -86,16 +86,28 @@ impl Ui {
 
     pub fn begin(&mut self) -> Result<()> {
         let (width, height) = terminal::size()?;
+        let resized = width != self.width || height != self.height;
         self.width = width;
         self.height = height;
         self.row = 0;
         self.clicks.clear();
         self.back_row = None;
-        queue!(self.out, Clear(ClearType::All), MoveTo(0, 0))?;
+        if resized {
+            queue!(self.out, Clear(ClearType::All), MoveTo(0, 0))?;
+        } else {
+            // 不做整屏清空，直接覆盖重绘，避免刷新时闪一下。
+            queue!(self.out, MoveTo(0, 0))?;
+        }
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        // 清掉本帧没有用到的残留行。
+        let mut row = self.row;
+        while row < self.height {
+            queue!(self.out, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+            row += 1;
+        }
         self.out.flush()?;
         Ok(())
     }

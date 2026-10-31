@@ -118,7 +118,7 @@ fn run(ui: &mut Ui) -> Result<()> {
             ui,
             "Minecraft 启动器",
             "↑↓/滚轮 选择    Enter/点击 确认    Esc 退出",
-            "↑↓/滚轮 选择    Enter/点击 确认    Esc 退出",
+            false,
             &rows,
             &items,
             selected,
@@ -203,21 +203,21 @@ fn missing_manifest(ui: &mut Ui) -> Result<()> {
 fn menu_loop(
     ui: &mut Ui,
     title: &str,
-    subtitle: &str,
     hint: &str,
+    back: bool,
     card: &[(&str, String)],
     items: &[String],
     initial: usize,
 ) -> Result<Option<usize>> {
     let mut selected = initial.min(items.len().saturating_sub(1));
     loop {
-        ui.header(title, subtitle)?;
+        ui.header(title, hint)?;
         if !card.is_empty() {
             ui.card("", card)?;
             ui.blank()?;
         }
         ui.menu(items, selected)?;
-        ui.footer(hint, true)?;
+        ui.footer(hint, back)?;
         ui.flush()?;
 
         match ui.wait()? {
@@ -711,7 +711,7 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
             ui,
             "账户管理",
             "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
-            "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
+            true,
             &rows,
             &items,
             selected,
@@ -818,7 +818,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
             ui,
             "启动器设置",
             "↑↓/滚轮 选择    Enter/点击 修改    Esc 返回",
-            "↑↓/滚轮 选择    Enter/点击 修改    Esc 返回",
+            true,
             &[],
             &items,
             selected,
