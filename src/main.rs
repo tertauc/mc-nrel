@@ -117,7 +117,7 @@ fn run(ui: &mut Ui) -> Result<()> {
         let Some(index) = menu_loop(
             ui,
             "Minecraft 启动器",
-            "↑↓/滚轮 选择，Enter/点击 确认，Esc 退出",
+            "↑↓/滚轮 选择    Enter/点击 确认    Esc 退出",
             "↑↓/滚轮 选择    Enter/点击 确认    Esc 退出",
             &rows,
             &items,
@@ -217,7 +217,7 @@ fn menu_loop(
             ui.blank()?;
         }
         ui.menu(items, selected)?;
-        ui.footer(hint)?;
+        ui.footer(hint, true)?;
         ui.flush()?;
 
         match ui.wait()? {
@@ -231,6 +231,8 @@ fn menu_loop(
             UiEvent::Click(index) => return Ok(Some(index)),
             UiEvent::ScrollUp => selected = ui::cycle_step(selected, items.len(), -1),
             UiEvent::ScrollDown => selected = ui::cycle_step(selected, items.len(), 1),
+            UiEvent::Back => return Ok(None),
+            UiEvent::Redraw => {}
         }
     }
 }
@@ -556,7 +558,7 @@ fn choose_version(
 
         ui.header(
             "版本选择",
-            "F1 最新正式版 · F2 最新快照 · Tab 切换范围 · Enter 选择并启动 · Esc 返回",
+            "F1 最新正式版    F2 最新快照    Tab 切换范围    Enter/点击 选择并启动    Esc 返回",
         )?;
         ui.card(
             "快捷启动",
@@ -608,6 +610,7 @@ fn choose_version(
         }
         ui.footer(
             "↑↓/滚轮 选择    Enter/点击 选择并启动    F1/F2 快捷启动    Tab 切换    Esc 返回",
+            true,
         )?;
         ui.flush()?;
 
@@ -637,6 +640,8 @@ fn choose_version(
             }
             UiEvent::ScrollUp => selected = ui::cycle_step(selected, visible.len(), -1),
             UiEvent::ScrollDown => selected = ui::cycle_step(selected, visible.len(), 1),
+            UiEvent::Back => return Ok(None),
+            UiEvent::Redraw => {}
             UiEvent::Key(key) => match key.code {
                 KeyCode::Esc => return Ok(None),
                 KeyCode::F(1) => return Ok(Some(manifest.latest.release.clone())),
@@ -705,7 +710,7 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
         let Some(index) = menu_loop(
             ui,
             "账户管理",
-            "↑↓/滚轮 选择   Enter/点击 确认   Esc 返回",
+            "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
             "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
             &rows,
             &items,
@@ -812,7 +817,7 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
         let Some(index) = menu_loop(
             ui,
             "启动器设置",
-            "↑↓/滚轮 选择   Enter/点击 修改   Esc 返回",
+            "↑↓/滚轮 选择    Enter/点击 修改    Esc 返回",
             "↑↓/滚轮 选择    Enter/点击 修改    Esc 返回",
             &[],
             &items,
@@ -1129,7 +1134,7 @@ fn draw_device_code(ui: &mut Ui, code: &auth::DeviceCode, remaining: u64) -> Res
     ui.dim_line(&format!("  等待授权完成… 剩余 {remaining} 秒"))?;
     ui.blank()?;
     ui.dim_line("  首次登录的账户可能需要先在 Xbox 官网创建档案，否则会提示没有游戏档案")?;
-    ui.footer("Esc 取消登录")?;
+    ui.footer("Esc 取消登录", false)?;
     ui.flush()
 }
 

@@ -30,6 +30,10 @@ pub enum UiEvent {
     Click(usize),
     ScrollUp,
     ScrollDown,
+    /// 点击了“返回”按钮。
+    Back,
+    /// 鼠标悬停变化，需要重绘。
+    Redraw,
 }
 
 pub struct Ui {
@@ -41,6 +45,12 @@ pub struct Ui {
     codepage: Option<(u32, u32)>,
     /// 当前画面中可点击的行与对应列表下标。
     clicks: Vec<(u16, usize)>,
+    /// 鼠标悬停的列表项（行、下标）。
+    hover: Option<(u16, usize)>,
+    /// “返回”按钮所在行。
+    back_row: Option<u16>,
+    /// 鼠标是否悬停在“返回”按钮上。
+    hover_back: bool,
 }
 
 impl Ui {
@@ -60,6 +70,9 @@ impl Ui {
             row: 0,
             codepage,
             clicks: Vec::new(),
+            hover: None,
+            back_row: None,
+            hover_back: false,
         })
     }
 
@@ -77,6 +90,7 @@ impl Ui {
         self.height = height;
         self.row = 0;
         self.clicks.clear();
+        self.back_row = None;
         queue!(self.out, Clear(ClearType::All), MoveTo(0, 0))?;
         Ok(())
     }
@@ -236,9 +250,10 @@ impl Ui {
                 break;
             }
             let highlighted = index == selected;
+            let hovered = self.hover == Some((self.row, index));
             let text = format!(
                 "  {} {}",
-                if highlighted { "▶" } else { " " },
+                if highlighted || hovered { "▶" } else { " " },
                 item
             );
             let text = truncate(&text, self.width as usize);
@@ -251,6 +266,13 @@ impl Ui {
                 queue!(
                     self.out,
                     SetBackgroundColor(Color::DarkCyan),
+                    SetForegroundColor(Color::White),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else if hovered {
+                queue!(
+                    self.out,
+                    SetBackgroundColor(Color::DarkGrey),
                     SetForegroundColor(Color::White),
                     SetAttribute(Attribute::Bold)
                 )?;
@@ -288,9 +310,10 @@ impl Ui {
                 break;
             }
             let highlighted = index == selected;
+            let hovered = self.hover == Some((self.row, index));
             let text = format!(
                 "  {} {}",
-                if highlighted { "▶" } else { " " },
+                if highlighted || hovered { "▶" } else { " " },
                 item
             );
             let text = truncate(&text, self.width as usize);
@@ -303,6 +326,13 @@ impl Ui {
                 queue!(
                     self.out,
                     SetBackgroundColor(Color::DarkCyan),
+                    SetForegroundColor(Color::White),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else if hovered {
+                queue!(
+                    self.out,
+                    SetBackgroundColor(Color::DarkGrey),
                     SetForegroundColor(Color::White),
                     SetAttribute(Attribute::Bold)
                 )?;
@@ -325,19 +355,52 @@ impl Ui {
         Ok(())
     }
 
-    pub fn footer(&mut self, hint: &str) -> Result<()> {
+    /// 绘制底部提示行；`back` 为真时在右下角显示“返回”按钮（仅鼠标可点击）。
+    pub fn footer(&mut self, hint: &str, back: bool) -> Result<()> {
         if self.height == 0 {
             return Ok(());
         }
         let y = self.height - 1;
+        let button = " ‹ 返回 › ";
+        let button_width = if back {
+            UnicodeWidthStr::width(button)
+        } else {
+            0
+        };
+        let limit = (self.width as usize).saturating_sub(button_width + 1);
         queue!(
             self.out,
             MoveTo(0, y),
             Clear(ClearType::CurrentLine),
             SetForegroundColor(Color::DarkGrey),
-            Print(truncate(hint, self.width as usize)),
+            Print(truncate(hint, limit)),
             ResetColor
         )?;
+        if back {
+            let x = self.width.saturating_sub(button_width as u16 + 1);
+            queue!(self.out, MoveTo(x, y))?;
+            if self.hover_back {
+                queue!(
+                    self.out,
+                    SetBackgroundColor(Color::DarkCyan),
+                    SetForegroundColor(Color::White),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else {
+                queue!(
+                    self.out,
+                    SetBackgroundColor(Color::DarkGrey),
+                    SetForegroundColor(Color::Grey)
+                )?;
+            }
+            queue!(
+                self.out,
+                Print(button),
+                ResetColor,
+                SetAttribute(Attribute::Reset)
+            )?;
+            self.back_row = Some(y);
+        }
         if self.row < self.height {
             self.row = self.height;
         }
@@ -374,7 +437,7 @@ impl Ui {
     }
 
     /// 阻塞等待一次有效输入（按键、点击列表项或滚轮）。
-    pub fn wait(&self) -> Result<UiEvent> {
+    pub fn wait(&mut self) -> Result<UiEvent> {
         loop {
             if let Some(ui_event) = self.read_event()? {
                 return Ok(ui_event);
@@ -383,7 +446,7 @@ impl Ui {
     }
 
     /// 在超时内等待一次有效输入；超时返回 `None`。
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<UiEvent>> {
+    pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<UiEvent>> {
         if !event::poll(timeout)? {
             return Ok(None);
         }
@@ -397,15 +460,45 @@ impl Ui {
         }
     }
 
-    fn read_event(&self) -> Result<Option<UiEvent>> {
+    fn read_event(&mut self) -> Result<Option<UiEvent>> {
         match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(UiEvent::Key(key))),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                // 键盘操作后取消鼠标悬停高亮。
+                self.hover = None;
+                self.hover_back = false;
+                Ok(Some(UiEvent::Key(key)))
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
+                    if self.back_row == Some(mouse.row) {
+                        return Ok(Some(UiEvent::Back));
+                    }
                     Ok(self.click_index(mouse.row).map(UiEvent::Click))
                 }
-                MouseEventKind::ScrollUp => Ok(Some(UiEvent::ScrollUp)),
-                MouseEventKind::ScrollDown => Ok(Some(UiEvent::ScrollDown)),
+                MouseEventKind::Moved => {
+                    let item = self
+                        .clicks
+                        .iter()
+                        .find(|(click_row, _)| *click_row == mouse.row)
+                        .copied();
+                    let over_back = self.back_row == Some(mouse.row);
+                    if item == self.hover && over_back == self.hover_back {
+                        return Ok(None);
+                    }
+                    self.hover = item;
+                    self.hover_back = over_back;
+                    Ok(Some(UiEvent::Redraw))
+                }
+                MouseEventKind::ScrollUp => {
+                    self.hover = None;
+                    self.hover_back = false;
+                    Ok(Some(UiEvent::ScrollUp))
+                }
+                MouseEventKind::ScrollDown => {
+                    self.hover = None;
+                    self.hover_back = false;
+                    Ok(Some(UiEvent::ScrollDown))
+                }
                 _ => Ok(None),
             },
             _ => Ok(None),
@@ -478,7 +571,7 @@ impl Ui {
             }
         }
         self.blank()?;
-        self.footer("按任意键返回")?;
+        self.footer("按任意键返回", false)?;
         self.flush()?;
         self.wait_key()
     }
@@ -515,7 +608,7 @@ impl Ui {
                     }
                     None => self.blank()?,
                 }
-                self.footer("Enter 确认    Esc 取消")?;
+                self.footer("Enter 确认    Esc 取消", false)?;
                 full = false;
             }
 
@@ -624,7 +717,7 @@ impl Ui {
                 start = selected;
             }
             self.list(items, selected, start, max_rows)?;
-            self.footer("↑↓/滚轮 选择    Enter/点击 确认    Esc 返回")?;
+            self.footer("↑↓/滚轮 选择    Enter/点击 确认    Esc 返回", true)?;
             self.flush()?;
 
             match self.wait()? {
@@ -638,6 +731,8 @@ impl Ui {
                 UiEvent::Click(index) => return Ok(Some(index)),
                 UiEvent::ScrollUp => selected = cycle_step(selected, items.len(), -1),
                 UiEvent::ScrollDown => selected = cycle_step(selected, items.len(), 1),
+                UiEvent::Back => return Ok(None),
+                UiEvent::Redraw => {}
             }
         }
     }
