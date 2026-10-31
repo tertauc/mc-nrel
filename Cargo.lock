@@ -3,24 +3,6 @@
 version = 4
 
 [[package]]
-name = "NREL"
-version = "0.8.1"
-dependencies = [
- "anyhow",
- "console",
- "crossterm",
- "indicatif",
- "md-5",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "unicode-width",
- "windows-sys 0.59.0",
- "zip",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,6 +718,24 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "nrel"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "console",
+ "crossterm",
+ "indicatif",
+ "md-5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "unicode-width",
+ "windows-sys 0.59.0",
+ "zip",
 ]
 
 [[package]]
