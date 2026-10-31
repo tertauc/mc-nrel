@@ -38,6 +38,8 @@ pub enum PollResult {
     SlowDown,
     Expired,
     Declined,
+    /// 设备代码已被使用（令牌已下发过一次），只能重新申请设备代码。
+    Used,
     Token(MsTokens),
     Error(String),
 }
@@ -147,7 +149,15 @@ pub fn poll_device_code(client: &Client, client_id: &str, device_code: &str) -> 
         "slow_down" => PollResult::SlowDown,
         "expired_token" | "bad_verification_code" => PollResult::Expired,
         "authorization_declined" | "access_denied" => PollResult::Declined,
-        _ => PollResult::Error(error_text(&value)),
+        _ => {
+            let detail = error_text(&value);
+            // 设备代码是一次性的：已经兑换过令牌后再轮询会返回该错误。
+            if detail.contains("AADSTS70000") || detail.contains("already been used") {
+                PollResult::Used
+            } else {
+                PollResult::Error(detail)
+            }
+        }
     }
 }
 
@@ -335,6 +345,40 @@ fn field(value: &Value, keys: &[&str]) -> Result<String> {
         }
     }
     bail!("认证响应缺少字段：{}", keys.join("/"))
+}
+
+/// Azure 应用注册（新建应用）页面，用于自定义登录页显示的应用名称与图标。
+pub const APP_REGISTRATION_URL: &str =
+    "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/CreateApplicationBlade";
+
+/// 把文本写入系统剪贴板，返回是否成功。
+pub fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // 设备代码只包含 ASCII 字符，直接通过 clip.exe 写入即可。
+        let Ok(mut child) = Command::new("clip")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        let written = match child.stdin.take() {
+            Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(),
+            None => false,
+        };
+        let _ = child.wait();
+        written
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        false
+    }
 }
 
 pub fn open_browser(url: &str) {

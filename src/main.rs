@@ -1351,7 +1351,7 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
             "离线登录（自定义用户名）".to_string(),
             "微软登录（浏览器设备码）".to_string(),
             "退出微软账户".to_string(),
-            "微软客户端 ID（高级）".to_string(),
+            "微软应用（登录页名称与图标）".to_string(),
         ];
 
         let Some(index) = ({
@@ -1407,10 +1407,64 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
                 }
             }
             3 => {
-                let current = cfg.ms_client_id();
+                ms_app_menu(ui, cfg)?;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 微软登录页显示的应用名称与图标由 Azure 应用注册决定，这里管理对应的客户端 ID。
+fn ms_app_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
+    let mut selected = 0usize;
+    loop {
+        let custom = cfg
+            .ms_client_id
+            .as_ref()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let rows = vec![
+            (
+                "登录页显示",
+                if custom.is_some() {
+                    "自定义应用（你注册的名称与图标）".to_string()
+                } else {
+                    "Prism Launcher（内置公开应用）".to_string()
+                },
+            ),
+            ("客户端 ID", cfg.ms_client_id()),
+        ];
+        let items = vec![
+            "填写自定义客户端 ID".to_string(),
+            "打开 Azure 应用注册页面".to_string(),
+            "查看注册步骤".to_string(),
+            "恢复内置默认应用".to_string(),
+        ];
+
+        let Some(index) = ({
+            let env = CmdEnv { cfg: &*cfg };
+            menu_loop(
+                ui,
+                "微软应用",
+                "↑↓/滚轮 选择    Enter/点击 确认    Esc 返回",
+                true,
+                &rows,
+                &items,
+                selected,
+                &env,
+            )
+        })?
+        else {
+            return Ok(());
+        };
+        selected = index;
+
+        match index {
+            0 => {
+                let current = custom.clone().unwrap_or_default();
                 let Some(value) = ui.input(
-                    "微软客户端 ID",
-                    "留空则使用内置的公开客户端 ID",
+                    "自定义微软客户端 ID",
+                    "Azure 应用注册页面里的“应用程序(客户端) ID”",
                     &current,
                     true,
                     None,
@@ -1418,13 +1472,46 @@ fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
                 else {
                     continue;
                 };
-                cfg.ms_client_id = if value.is_empty() { None } else { Some(value) };
+                cfg.ms_client_id = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
                 cfg.save()?;
+                if cfg.ms_refresh_token.is_some() {
+                    ui.alert(
+                        "需要重新登录",
+                        "已更换微软应用。原有的登录令牌属于旧应用，请重新登录微软账户。",
+                    )?;
+                }
+            }
+            1 => auth::open_browser(auth::APP_REGISTRATION_URL),
+            2 => ui.notice("注册自定义微软应用", APP_REGISTRATION_STEPS)?,
+            3 => {
+                cfg.ms_client_id = None;
+                cfg.save()?;
+                if cfg.ms_refresh_token.is_some() {
+                    ui.alert(
+                        "需要重新登录",
+                        "已恢复内置应用。原有的登录令牌属于自定义应用，请重新登录微软账户。",
+                    )?;
+                }
             }
             _ => {}
         }
     }
 }
+
+const APP_REGISTRATION_STEPS: &str = "\
+登录微软账号时，授权页显示的应用名称和图标来自 Azure 应用注册，而不是启动器本身。\
+内置的是 Prism Launcher 的公开应用，因此会显示成 Prism Launcher。\n\
+想显示成你自己的名字和图标，注册一个自己的应用即可（免费，只需几分钟）：\n\
+1. 打开 Azure 门户，进入 Microsoft Entra ID → 应用注册 → 新注册，名称填写 NREL。\n\
+2. 帐户类型选择“任何组织目录中的帐户和个人 Microsoft 帐户”。\n\
+3. 注册完成后，在“身份验证”页底部把“允许公共客户端流”设为“是”（设备码登录需要）。\n\
+4. 在“品牌与属性”中上传你的图标（正方形 PNG 或 JPG），授权页就会显示它。\n\
+5. 复制“应用程序(客户端) ID”，回到上一步选择“填写自定义客户端 ID”粘贴进去。\n\
+不需要配置重定向 URI，也不需要 API 权限。";
 
 fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
     let mut selected = 0usize;
@@ -1750,57 +1837,82 @@ fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opti
 fn microsoft_login(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Option<auth::Session>> {
     let client_id = cfg.ms_client_id();
 
-    logs::info("开始微软设备码登录");
-    ui.begin_work("微软登录", "正在申请设备代码…")?;
-    ui.flush()?;
-    let code = match auth::request_device_code(client, &client_id) {
-        Ok(code) => code,
-        Err(err) => {
-            ui.alert("无法开始微软登录", &format!("{err:#}"))?;
-            return Ok(None);
-        }
-    };
+    logs::info(format!("开始微软设备码登录（客户端 ID：{client_id}）"));
 
-    auth::open_browser(&code.verification_uri);
-
-    let mut interval = code.interval.max(1);
-    let deadline = Instant::now() + Duration::from_secs(code.expires_in);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
-        draw_device_code(ui, &code, remaining)?;
-        if wait_cancel(ui, interval)? {
-            return Ok(None);
-        }
-
-        match auth::poll_device_code(client, &client_id, &code.device_code) {
-            auth::PollResult::Pending => {}
-            auth::PollResult::SlowDown => interval += 5,
-            auth::PollResult::Expired => {
-                ui.alert("设备代码已过期", "授权等待超时，请重新登录。")?;
+    // 设备代码是一次性的：若已被使用（例如在别的窗口兑换过令牌），
+    // 自动重新申请一个新的设备代码，避免登录直接失败。
+    let mut attempts = 0u32;
+    'login: loop {
+        attempts += 1;
+        ui.begin_work("微软登录", "正在申请设备代码…")?;
+        ui.flush()?;
+        let code = match auth::request_device_code(client, &client_id) {
+            Ok(code) => code,
+            Err(err) => {
+                ui.alert("无法开始微软登录", &format!("{err:#}"))?;
                 return Ok(None);
             }
-            auth::PollResult::Declined => {
-                ui.alert("已取消授权", "你取消了微软账户授权。")?;
+        };
+
+        let copied = auth::copy_to_clipboard(&code.user_code);
+        auth::open_browser(&code.verification_uri);
+
+        let mut interval = code.interval.max(1);
+        let deadline = Instant::now() + Duration::from_secs(code.expires_in);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+            draw_device_code(ui, &code, remaining, copied)?;
+            if wait_cancel(ui, interval)? {
                 return Ok(None);
             }
-            auth::PollResult::Error(err) => {
-                ui.alert("微软登录失败", &err)?;
-                return Ok(None);
-            }
-            auth::PollResult::Token(tokens) => {
-                ui.begin_work("微软登录", "正在验证 Xbox 与 Minecraft 账户…")?;
-                ui.work_line("微软授权成功，正在获取游戏档案…")?;
-                ui.flush()?;
-                match auth::login_with_ms(client, &tokens.access_token) {
-                    Ok(session) => {
-                        store_ms_login(cfg, &tokens, &session);
-                        cfg.save()?;
-                        return Ok(Some(session));
-                    }
-                    Err(err) => {
-                        ui.alert("微软账户无法启动 Minecraft", &format!("{err:#}"))?;
+
+            match auth::poll_device_code(client, &client_id, &code.device_code) {
+                auth::PollResult::Pending => {}
+                auth::PollResult::SlowDown => interval += 5,
+                auth::PollResult::Expired => {
+                    ui.alert("设备代码已过期", "授权等待超时，请重新登录。")?;
+                    return Ok(None);
+                }
+                auth::PollResult::Declined => {
+                    ui.alert("已取消授权", "你取消了微软账户授权。")?;
+                    return Ok(None);
+                }
+                auth::PollResult::Used => {
+                    logs::error("设备代码已被使用，重新申请新的设备代码");
+                    if attempts >= 3 {
+                        ui.alert(
+                            "微软登录失败",
+                            "设备代码已被使用且无法自动恢复，请稍后重新登录。",
+                        )?;
                         return Ok(None);
+                    }
+                    ui.alert(
+                        "设备代码已失效",
+                        "该设备代码已经被使用过了，需要重新授权。\n\n按任意键后会申请新的设备代码，请重新在浏览器中完成授权。",
+                    )?;
+                    continue 'login;
+                }
+                auth::PollResult::Error(err) => {
+                    logs::error(format!("微软设备码轮询失败：{err}"));
+                    ui.alert("微软登录失败", &err)?;
+                    return Ok(None);
+                }
+                auth::PollResult::Token(tokens) => {
+                    ui.begin_work("微软登录", "正在验证 Xbox 与 Minecraft 账户…")?;
+                    ui.work_line("微软授权成功，正在获取游戏档案…")?;
+                    ui.flush()?;
+                    match auth::login_with_ms(client, &tokens.access_token) {
+                        Ok(session) => {
+                            store_ms_login(cfg, &tokens, &session);
+                            cfg.save()?;
+                            return Ok(Some(session));
+                        }
+                        Err(err) => {
+                            logs::error(format!("微软账户验证失败：{err:#}"));
+                            ui.alert("微软账户无法启动 Minecraft", &format!("{err:#}"))?;
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -1808,7 +1920,12 @@ fn microsoft_login(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opt
     }
 }
 
-fn draw_device_code(ui: &mut Ui, code: &auth::DeviceCode, remaining: u64) -> Result<()> {
+fn draw_device_code(
+    ui: &mut Ui,
+    code: &auth::DeviceCode,
+    remaining: u64,
+    copied: bool,
+) -> Result<()> {
     ui.header("微软登录", "在浏览器中完成授权，然后回到这里")?;
     ui.blank()?;
     ui.line("  1. 浏览器已自动打开授权页面；如果没有打开，请手动访问：")?;
@@ -1817,6 +1934,11 @@ fn draw_device_code(ui: &mut Ui, code: &auth::DeviceCode, remaining: u64) -> Res
     ui.line("  2. 在页面中输入下面的代码：")?;
     ui.blank()?;
     ui.centered(&code.user_code, Color::Cyan, true)?;
+    if copied {
+        ui.dim_line("  代码已自动复制到剪贴板，可直接粘贴")?;
+    } else {
+        ui.dim_line("  未能写入剪贴板，请手动输入上面的代码")?;
+    }
     ui.blank()?;
     ui.dim_line(&format!("  等待授权完成… 剩余 {remaining} 秒"))?;
     ui.blank()?;
