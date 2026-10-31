@@ -148,7 +148,11 @@ fn run(ui: &mut Ui) -> Result<()> {
                     client: &client,
                     manifest: manifest.as_ref(),
                 };
-                main_menu(ui, &rows, &items, &mut selected, &env)?
+                match main_menu(ui, &rows, &items, &mut selected, &env)? {
+                    Some(action) => action,
+                    // 切换线程等操作需要重新按当前线程的界面状态路由。
+                    None => continue,
+                }
             }
         };
         logs::info(format!("执行操作：{}", action.label()));
@@ -405,7 +409,7 @@ fn threads_report() -> String {
             thread.screen.label()
         ));
     }
-    text.push_str("\n/thread new 新建线程（/t new）    /thread N 切换线程（/t N）    /bg 在后台启动当前版本");
+    text.push_str("\n/thread new 新建线程（/t new）    /thread N 切换线程（/t N）    /thread del N 删除线程（/t del N）");
     text
 }
 
@@ -427,6 +431,30 @@ fn switch_thread(index: usize) -> Result<usize> {
     Ok(index)
 }
 
+/// 删除一个空闲线程，并自动修正当前线程下标。
+fn delete_thread(index: usize) -> Result<usize> {
+    let mut list = THREADS.lock().unwrap();
+    if list.len() <= 1 {
+        bail!("至少需要保留一个线程");
+    }
+    if index >= list.len() {
+        bail!("线程 {} 不存在", index + 1);
+    }
+    let status = list[index].status.lock().unwrap().clone();
+    if status.starts_with("启动中") || status.starts_with("运行中") {
+        bail!("线程 {} 正在运行游戏，无法删除", index + 1);
+    }
+    let len = list.len();
+    list.remove(index);
+    let mut active = ACTIVE_THREAD.load(Ordering::SeqCst);
+    if active > index {
+        active -= 1;
+    }
+    active = active.min(len - 2);
+    ACTIVE_THREAD.store(active, Ordering::SeqCst);
+    Ok(active)
+}
+
 const MAIN_HINT: &str =
     "↑↓/滚轮 选择    Enter/点击 确认    / 命令    Esc 不可用，请选择“退出”";
 
@@ -436,7 +464,7 @@ fn main_menu(
     items: &[String],
     selected: &mut usize,
     env: &CmdEnv,
-) -> Result<MainAction> {
+) -> Result<Option<MainAction>> {
     loop {
         if *selected >= items.len() {
             *selected = 0;
@@ -451,20 +479,20 @@ fn main_menu(
         let event = ui.wait()?;
         if let Some(result) = maybe_command(ui, &event, env, true)? {
             match result {
-                CommandResult::Action(action) => return Ok(action),
-                CommandResult::Quit => return Ok(MainAction::Exit),
-                _ => {}
+                CommandResult::Action(action) => return Ok(Some(action)),
+                CommandResult::Quit => return Ok(Some(MainAction::Exit)),
+                // 线程切换或 /main：交回主循环按新线程的界面状态重新路由。
+                CommandResult::Main | CommandResult::Handled => return Ok(None),
             }
-            continue;
         }
         match event {
             UiEvent::Key(key) => match key.code {
                 KeyCode::Up => *selected = ui::cycle_step(*selected, items.len(), -1),
                 KeyCode::Down => *selected = ui::cycle_step(*selected, items.len(), 1),
-                KeyCode::Enter => return Ok(action_at(*selected)),
+                KeyCode::Enter => return Ok(Some(action_at(*selected))),
                 _ => {}
             },
-            UiEvent::Click(index) => return Ok(action_at(index)),
+            UiEvent::Click(index) => return Ok(Some(action_at(index))),
             UiEvent::ScrollUp => *selected = ui::cycle_step(*selected, items.len(), -1),
             UiEvent::ScrollDown => *selected = ui::cycle_step(*selected, items.len(), 1),
             UiEvent::Back | UiEvent::Redraw => {}
@@ -613,10 +641,10 @@ fn dispatch_command(
                  /account    打开账户管理（别名 /a）\n\
                  /settings   打开启动器设置（别名 /s）\n\
                  /refresh    刷新版本列表（别名 /r）\n\
-                 /bg         在当前线程后台启动当前版本\n\
                  /thread     查看所有启动器线程（别名 /t）\n\
                  /thread new 新建线程并切换过去（/t new）\n\
                  /thread N   切换到第 N 个线程（/t N）\n\
+                 /thread del N 删除空闲线程（/t del N）\n\
                  /version    查看启动器版本与目录\n\
                  /dir        查看游戏目录",
             )?;
@@ -647,9 +675,28 @@ fn dispatch_command(
             )?;
             return Ok(CommandResult::Main);
         }
-        "/bg" | "/start" | "/background" => {
-            let message = spawn_background_launch(env)?;
-            ui.notice("后台启动", &message)?;
+        _ if cmd.starts_with("/thread del") => {
+            let value = cmd.trim_start_matches("/thread del").trim();
+            match value.parse::<usize>() {
+                Ok(number) if number >= 1 => match delete_thread(number - 1) {
+                    Ok(_) => {
+                        ui.notice(
+                            "删除线程",
+                            &format!("已删除线程 {number}。\n\n{}", threads_report()),
+                        )?;
+                        return Ok(CommandResult::Main);
+                    }
+                    Err(err) => {
+                        ui.alert("无法删除线程", &format!("{err:#}"))?;
+                    }
+                },
+                _ => {
+                    ui.notice(
+                        "命令用法",
+                        "/thread del N 删除第 N 个空闲线程（/t del N）",
+                    )?;
+                }
+            }
         }
         _ if cmd.starts_with("/thread ") => {
             let value = cmd.trim_start_matches("/thread ").trim();
@@ -669,7 +716,7 @@ fn dispatch_command(
                 _ => {
                     ui.notice(
                         "命令用法",
-                        "/thread new 新建线程（/t new）\n/thread N 切换到第 N 个线程（/t N）",
+                        "/thread new 新建线程（/t new）\n/thread N 切换到第 N 个线程（/t N）\n/thread del N 删除第 N 个空闲线程（/t del N）",
                     )?;
                 }
             }
@@ -677,7 +724,9 @@ fn dispatch_command(
         _ => {
             ui.alert(
                 "未知命令",
-                &format!("{cmd}\n\n输入 /help 查看可用命令。"),
+                &format!(
+                    "{cmd}\n\n输入 /help 查看可用命令。启动游戏默认后台运行，直接使用 /launch。"
+                ),
             )?;
         }
     }
