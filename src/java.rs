@@ -71,6 +71,21 @@ fn scan_all() -> Vec<JavaInfo> {
         bases.push(home.join(".jdks"));
         bases.push(home.join(".gradle").join("jdks"));
     }
+    #[cfg(target_os = "macos")]
+    {
+        bases.push(PathBuf::from("/Library/Java/JavaVirtualMachines"));
+        if let Some(home) = env::var_os("HOME") {
+            bases.push(PathBuf::from(home).join("Library/Java/JavaVirtualMachines"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        bases.push(PathBuf::from("/usr/lib/jvm"));
+        bases.push(PathBuf::from("/usr/share/jvm"));
+        if let Some(home) = env::var_os("HOME") {
+            bases.push(PathBuf::from(home).join(".sdkman/candidates/java"));
+        }
+    }
 
     for base in &bases {
         scan_base(base, &mut push);
@@ -211,7 +226,8 @@ pub fn pick(configured: Option<&str>, required: u32) -> Result<JavaInfo> {
         .collect();
     if candidates.is_empty() {
         bail!(
-            "未找到满足 Java {required}+ 的运行环境，请在“启动器设置 → Java”中手动指定 java.exe 路径"
+            "未找到满足 Java {required}+ 的运行环境，请在“启动器设置 → Java”中手动指定 {} 路径",
+            java_exe()
         );
     }
     candidates.sort_by_key(|java| (java.major, if java.bits == 64 { 0 } else { 1 }));

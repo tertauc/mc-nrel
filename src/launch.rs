@@ -107,7 +107,8 @@ pub fn build_command(
         .map(|path| path.display().to_string())
         .collect();
     classpath_entries.push(game_jar.display().to_string());
-    let classpath = classpath_entries.join(";");
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let classpath = classpath_entries.join(separator);
 
     let assets_root = install::assets_dir(&root);
     let assets_index = version
@@ -158,7 +159,7 @@ pub fn build_command(
     vars.insert("launcher_name", "NREL".to_string());
     vars.insert("launcher_version", env!("CARGO_PKG_VERSION").to_string());
     vars.insert("classpath", classpath.clone());
-    vars.insert("classpath_separator", ";".to_string());
+    vars.insert("classpath_separator", separator.to_string());
     vars.insert(
         "library_directory",
         install::libraries_dir(&root).display().to_string(),

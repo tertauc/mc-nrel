@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use md5::{Digest, Md5};
-use reqwest::blocking::Client;
-use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+use crate::net::HttpClient;
 
 /// Prism Launcher 的公开 Azure 应用 ID，可用于设备码登录。
 pub const DEFAULT_CLIENT_ID: &str = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
@@ -95,14 +95,14 @@ fn default_interval() -> u64 {
     5
 }
 
-pub fn request_device_code(client: &Client, client_id: &str) -> Result<DeviceCode> {
+pub fn request_device_code(client: &HttpClient, client_id: &str) -> Result<DeviceCode> {
     let (status, value) = post_form(
         client,
         DEVICE_CODE_URL,
         &[("client_id", client_id), ("scope", SCOPE)],
     )?;
 
-    if !status.is_success() {
+    if !success(status) {
         bail!("无法获取微软设备代码：{}", error_text(&value));
     }
 
@@ -118,7 +118,7 @@ pub fn request_device_code(client: &Client, client_id: &str) -> Result<DeviceCod
     })
 }
 
-pub fn poll_device_code(client: &Client, client_id: &str, device_code: &str) -> PollResult {
+pub fn poll_device_code(client: &HttpClient, client_id: &str, device_code: &str) -> PollResult {
     let result = post_form(
         client,
         TOKEN_URL,
@@ -137,7 +137,7 @@ pub fn poll_device_code(client: &Client, client_id: &str, device_code: &str) -> 
         Err(err) => return PollResult::Error(format!("{err:#}")),
     };
 
-    if status.is_success() {
+    if success(status) {
         return match parse_tokens(&value) {
             Some(tokens) => PollResult::Token(tokens),
             None => PollResult::Error("微软登录响应缺少访问令牌".to_string()),
@@ -161,7 +161,7 @@ pub fn poll_device_code(client: &Client, client_id: &str, device_code: &str) -> 
     }
 }
 
-pub fn refresh(client: &Client, client_id: &str, refresh_token: &str) -> Result<MsTokens> {
+pub fn refresh(client: &HttpClient, client_id: &str, refresh_token: &str) -> Result<MsTokens> {
     let (status, value) = post_form(
         client,
         TOKEN_URL,
@@ -173,7 +173,7 @@ pub fn refresh(client: &Client, client_id: &str, refresh_token: &str) -> Result<
         ],
     )?;
 
-    if !status.is_success() {
+    if !success(status) {
         bail!("微软登录已过期：{}", error_text(&value));
     }
 
@@ -190,32 +190,32 @@ fn parse_tokens(value: &Value) -> Option<MsTokens> {
     })
 }
 
+/// 发送表单请求，返回状态码与解析后的 JSON（非 2xx 也会返回响应体）。
 fn post_form(
-    client: &Client,
+    client: &HttpClient,
     url: &str,
     form: &[(&str, &str)],
-) -> Result<(StatusCode, Value)> {
-    let resp = client
-        .post(url)
-        .form(form)
-        .send()
-        .with_context(|| format!("无法连接微软登录服务：{url}"))?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
-    let value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-    Ok((status, value))
+) -> Result<(u16, Value)> {
+    let body: String = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form)
+        .finish();
+    let (status, text) = client.post_text(url, "application/x-www-form-urlencoded", &body)?;
+    Ok((status, parse_json(&text)))
 }
 
-fn post_json(client: &Client, url: &str, body: &Value) -> Result<(StatusCode, Value)> {
-    let resp = client
-        .post(url)
-        .json(body)
-        .send()
-        .with_context(|| format!("请求失败：{url}"))?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
-    let value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-    Ok((status, value))
+fn post_json(client: &HttpClient, url: &str, body: &Value) -> Result<(u16, Value)> {
+    let text = serde_json::to_string(body).context("无法序列化请求内容")?;
+    let (status, text) = client.post_text(url, "application/json", &text)?;
+    Ok((status, parse_json(&text)))
+}
+
+/// 响应体按 JSON 解析，失败时原样保留文本。
+fn parse_json(text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|_| json!({ "raw": text }))
+}
+
+fn success(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 fn error_text(value: &Value) -> String {
@@ -232,7 +232,7 @@ fn error_text(value: &Value) -> String {
 }
 
 /// 完整认证链：微软令牌 → Xbox Live → XSTS → Minecraft → 玩家档案。
-pub fn login_with_ms(client: &Client, ms_access_token: &str) -> Result<Session> {
+pub fn login_with_ms(client: &HttpClient, ms_access_token: &str) -> Result<Session> {
     // 1. Xbox Live 用户令牌
     let (status, value) = post_json(
         client,
@@ -247,7 +247,7 @@ pub fn login_with_ms(client: &Client, ms_access_token: &str) -> Result<Session> 
             "TokenType": "JWT"
         }),
     )?;
-    if !status.is_success() {
+    if !success(status) {
         bail!("Xbox Live 认证失败：{}", error_text(&value));
     }
     let xbl_token = field(&value, &["Token"])?;
@@ -273,7 +273,7 @@ pub fn login_with_ms(client: &Client, ms_access_token: &str) -> Result<Session> 
             "TokenType": "JWT"
         }),
     )?;
-    if !status.is_success() {
+    if !success(status) {
         let xerr = value.get("XErr").and_then(Value::as_i64).unwrap_or(0);
         let message = match xerr {
             2148916233 => "该微软账户还没有 Xbox 账户，请先在 Xbox 官网创建档案",
@@ -293,7 +293,7 @@ pub fn login_with_ms(client: &Client, ms_access_token: &str) -> Result<Session> 
         MC_LOGIN_URL,
         &json!({ "identityToken": format!("XBL3.0 x={uhs};{xsts_token}") }),
     )?;
-    if !status.is_success() {
+    if !success(status) {
         bail!("Minecraft 登录失败：{}", error_text(&value));
     }
     let access_token = value
@@ -303,19 +303,13 @@ pub fn login_with_ms(client: &Client, ms_access_token: &str) -> Result<Session> 
         .to_string();
 
     // 4. 玩家档案（确认是否拥有游戏）
-    let resp = client
-        .get(MC_PROFILE_URL)
-        .bearer_auth(&access_token)
-        .send()
-        .context("无法获取 Minecraft 玩家档案")?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
-    let value: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
+    let (status, text) = client.get_text_status(MC_PROFILE_URL, Some(&access_token))?;
+    let value = parse_json(&text);
 
-    if status == StatusCode::NOT_FOUND {
+    if status == 404 {
         bail!("该微软账户未拥有 Minecraft Java 版");
     }
-    if !status.is_success() {
+    if !success(status) {
         bail!("获取 Minecraft 玩家档案失败：{}", error_text(&value));
     }
 
@@ -349,44 +343,52 @@ fn field(value: &Value, keys: &[&str]) -> Result<String> {
 
 /// 把文本写入系统剪贴板，返回是否成功。
 pub fn copy_to_clipboard(text: &str) -> bool {
-    #[cfg(windows)]
-    {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
-        // 设备代码只包含 ASCII 字符，直接通过 clip.exe 写入即可。
-        let Ok(mut child) = Command::new("clip")
+    // 设备代码只包含 ASCII 字符，逐个尝试各平台的剪贴板命令。
+    let candidates: &[(&str, &[&str])] = if cfg!(windows) {
+        &[("clip", &[])]
+    } else if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    for (program, args) in candidates {
+        let Ok(mut child) = Command::new(program)
+            .args(*args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
         else {
-            return false;
+            continue;
         };
         let written = match child.stdin.take() {
             Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(),
             None => false,
         };
         let _ = child.wait();
-        written
+        if written {
+            return true;
+        }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = text;
-        false
-    }
+    false
 }
 
 pub fn open_browser(url: &str) {
-    #[cfg(windows)]
-    {
-        use std::process::Command;
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = url;
-    }
+    use std::process::Command;
+
+    let _ = if cfg!(windows) {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).spawn()
+    } else {
+        Command::new("xdg-open").arg(url).spawn()
+    };
 }

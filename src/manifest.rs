@@ -63,7 +63,7 @@ impl VersionEntry {
 
 /// 获取版本清单。优先读 30 分钟内的缓存，返回的 `bool` 表示数据是否来自缓存。
 pub fn fetch(
-    client: &reqwest::blocking::Client,
+    client: &net::HttpClient,
     mirror: MirrorKind,
     force: bool,
 ) -> Result<(VersionManifest, bool)> {

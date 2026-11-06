@@ -202,6 +202,33 @@ fn platform_total_memory_mb() -> u64 {
 
 #[cfg(not(windows))]
 fn platform_total_memory_mb() -> u64 {
-    // 非 Windows 平台仅做兜底估算。
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        if let Ok(output) = Command::new("sysctl").args(["-n", "hw.memsize"]).output()
+            && let Ok(bytes) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>()
+        {
+            return bytes / 1024 / 1024;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+            for line in text.lines() {
+                if let Some(value) = line.strip_prefix("MemTotal:") {
+                    if let Some(kb) = value
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        return kb / 1024;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    // 读取失败时的保守兜底。
     8192
 }

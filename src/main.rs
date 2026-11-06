@@ -19,12 +19,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::style::Color;
-use reqwest::blocking::Client;
 use unicode_width::UnicodeWidthStr;
 
 use crate::config::{Config, LogLevel, LoginMode};
 use crate::manifest::VersionManifest;
 use crate::mirror::MirrorKind;
+use crate::net::HttpClient;
 use crate::ui::{Ui, UiEvent};
 
 const MAIN_MENU: [&str; 5] = [
@@ -726,7 +726,7 @@ fn dispatch_command(
     Ok(CommandResult::Handled)
 }
 
-fn load_manifest(ui: &mut Ui, client: &Client, cfg: &Config, force: bool) -> Result<VersionManifest> {
+fn load_manifest(ui: &mut Ui, client: &HttpClient, cfg: &Config, force: bool) -> Result<VersionManifest> {
     ui.begin_work(
         if force {
             "正在刷新版本列表"
@@ -752,7 +752,7 @@ fn load_manifest(ui: &mut Ui, client: &Client, cfg: &Config, force: bool) -> Res
     Ok(manifest)
 }
 
-fn refresh_manifest(ui: &mut Ui, client: &Client, cfg: &Config) -> Result<VersionManifest> {
+fn refresh_manifest(ui: &mut Ui, client: &HttpClient, cfg: &Config) -> Result<VersionManifest> {
     load_manifest(ui, client, cfg, true)
 }
 
@@ -883,7 +883,7 @@ fn java_label(cfg: &Config) -> String {
 /// 前台启动：安装与启动过程在当前线程界面展示，启动后回到界面并显示运行状态。
 fn start_game(
     ui: &mut Ui,
-    client: &Client,
+    client: &HttpClient,
     cfg: &mut Config,
     manifest: &VersionManifest,
 ) -> Result<()> {
@@ -1047,7 +1047,7 @@ fn choose_java(ui: &mut Ui, cfg: &mut Config, required: u32) -> Result<Option<ja
             format!("[{tag}] {}", info.label())
         })
         .collect();
-    items.push("手动输入 java.exe 路径".to_string());
+    items.push("手动输入 Java 路径".to_string());
 
     let Some(index) = ui.pick(
         "选择 Java 运行环境",
@@ -1063,7 +1063,7 @@ fn choose_java(ui: &mut Ui, cfg: &mut Config, required: u32) -> Result<Option<ja
         return Ok(Some(detected[index].clone()));
     }
 
-    let Some(value) = ui.input("Java 路径", "java.exe 的完整路径", "", false, None)? else {
+    let Some(value) = ui.input("Java 路径", "Java 可执行文件的完整路径", "", false, None)? else {
         return Ok(None);
     };
     let path = PathBuf::from(value.trim_matches('"'));
@@ -1122,7 +1122,7 @@ fn collect_versions(root: &Path, manifest: &VersionManifest) -> Vec<VersionRow> 
 
 fn choose_version(
     ui: &mut Ui,
-    client: &Client,
+    client: &HttpClient,
     cfg: &mut Config,
     manifest: &mut VersionManifest,
 ) -> Result<Option<String>> {
@@ -1349,7 +1349,7 @@ fn choose_version(
     }
 }
 
-fn account_menu(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<()> {
+fn account_menu(ui: &mut Ui, client: &HttpClient, cfg: &mut Config) -> Result<()> {
     let mut selected = 0usize;
     loop {
         let rows = vec![
@@ -1643,7 +1643,7 @@ fn java_settings(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
     let detected = java::detect_all();
     let mut items: Vec<String> = vec!["自动选择（推荐）".to_string()];
     items.extend(detected.iter().map(java::JavaInfo::label));
-    items.push("手动输入 java.exe 路径".to_string());
+    items.push("手动输入 Java 路径".to_string());
 
     let default = match &cfg.java_path {
         Some(path) => detected
@@ -1671,7 +1671,7 @@ fn java_settings(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
         cfg.java_path = Some(detected[index - 1].path.display().to_string());
         cfg.save()?;
     } else {
-        let Some(value) = ui.input("Java 路径", "java.exe 的完整路径", "", false, None)? else {
+        let Some(value) = ui.input("Java 路径", "Java 可执行文件的完整路径", "", false, None)? else {
             return Ok(());
         };
         let path = PathBuf::from(value.trim_matches('"'));
@@ -1688,7 +1688,7 @@ fn java_settings(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
     Ok(())
 }
 
-fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Option<auth::Session>> {
+fn ensure_session(ui: &mut Ui, client: &HttpClient, cfg: &mut Config) -> Result<Option<auth::Session>> {
     match cfg.login_mode {
         LoginMode::Offline => {
             let name = cfg.username.trim().to_string();
@@ -1749,7 +1749,7 @@ fn ensure_session(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Opti
     }
 }
 
-fn microsoft_login(ui: &mut Ui, client: &Client, cfg: &mut Config) -> Result<Option<auth::Session>> {
+fn microsoft_login(ui: &mut Ui, client: &HttpClient, cfg: &mut Config) -> Result<Option<auth::Session>> {
     let client_id = cfg.ms_client_id();
 
     logs::info(format!("开始微软设备码登录（客户端 ID：{client_id}）"));

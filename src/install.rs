@@ -4,13 +4,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
 use serde::Deserialize;
 
 use crate::config::Config;
 use crate::manifest::VersionEntry;
 use crate::mirror::MirrorKind;
-use crate::net::{self, DownloadTask};
+use crate::net::{self, DownloadTask, HttpClient};
 use crate::ui;
 
 pub const LIBRARIES_BASE: &str = "https://libraries.minecraft.net";
@@ -388,7 +387,7 @@ pub fn list_local_versions(root: &Path) -> Vec<LocalVersion> {
 
 /// 补全缺失的版本文件，已下载且大小正确的文件会自动跳过。
 pub fn ensure_installed(
-    client: &Client,
+    client: &HttpClient,
     cfg: &Config,
     entry: &VersionEntry,
 ) -> Result<VersionJson> {
@@ -462,7 +461,7 @@ pub fn ensure_installed(
 
 /// 下载 log4j 配置：先试镜像，失败后回退官方地址。
 fn ensure_log_config(
-    client: &Client,
+    client: &HttpClient,
     mirror: MirrorKind,
     file: &LoggingFile,
     path: &Path,
@@ -496,7 +495,7 @@ fn client_artifact_url(artifact: &Artifact) -> String {
 }
 
 fn ensure_assets(
-    client: &Client,
+    client: &HttpClient,
     cfg: &Config,
     root: &Path,
     index_ref: &AssetIndexRef,
@@ -618,24 +617,41 @@ pub fn rules_allow(rules: &[Rule], features: &HashMap<String, bool>) -> bool {
     allowed
 }
 
+/// 当前系统在 Minecraft 清单中的名称。
+pub fn os_name() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "osx"
+    } else {
+        "linux"
+    }
+}
+
+/// 当前 CPU 架构在 Minecraft 清单中的名称。
+fn os_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x86"
+    }
+}
+
 fn rule_matches(rule: &Rule, features: &HashMap<String, bool>) -> bool {
     if let Some(os) = &rule.os {
         if let Some(name) = &os.name
-            && name != "windows"
+            && name != os_name()
         {
             return false;
         }
-        if let Some(arch) = &os.arch {
-            let ours = if cfg!(target_arch = "x86_64") {
-                "x86_64"
-            } else {
-                "x86"
-            };
-            if arch != ours {
-                return false;
-            }
+        if let Some(arch) = &os.arch
+            && arch != os_arch()
+        {
+            return false;
         }
-        // Windows 版本条件（如 "^10\\."）默认视为满足。
+        // 系统版本条件（如 "^10\\."）默认视为满足。
         let _ = &os.version;
     }
 
@@ -687,14 +703,14 @@ pub fn plan_libraries(
         }
 
         let artifact = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref());
-        let has_windows_natives = lib
+        let native_classifier = lib
             .natives
             .as_ref()
-            .map(|natives| natives.contains_key("windows"))
-            .unwrap_or(false);
+            .and_then(|natives| natives.get(os_name()))
+            .cloned();
 
         // 纯 native 库（如 jinput-platform）没有基础 jar，只下载分类器文件。
-        if (artifact.is_some() || !has_windows_natives)
+        if (artifact.is_some() || native_classifier.is_none())
             && let Some(resolved) = resolve_artifact(&lib_root, &lib.name, artifact, None)?
         {
             if seen_classpath.insert(resolved.full_path.clone()) {
@@ -709,16 +725,16 @@ pub fn plan_libraries(
             }
         }
 
-        let Some(classifier) = lib.natives.as_ref().and_then(|n| n.get("windows")) else {
+        let Some(classifier) = native_classifier else {
             continue;
         };
         let native_artifact = lib
             .downloads
             .as_ref()
             .and_then(|d| d.classifiers.as_ref())
-            .and_then(|c| c.get(classifier));
+            .and_then(|c| c.get(&classifier));
         if let Some(resolved) =
-            resolve_artifact(&lib_root, &lib.name, native_artifact, Some(classifier))?
+            resolve_artifact(&lib_root, &lib.name, native_artifact, Some(&classifier))?
             && seen_download.insert(resolved.full_path.clone())
         {
             let mut exclude = lib

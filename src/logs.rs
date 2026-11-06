@@ -123,7 +123,8 @@ fn platform_parts() -> (u16, u8, u8, u8, u8, u8) {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs() as i64;
+        .as_secs() as i64
+        + local_offset_secs();
     let days = seconds.div_euclid(86400);
     let rest = seconds.rem_euclid(86400);
     let (year, month, day) = civil_from_days(days);
@@ -135,6 +136,33 @@ fn platform_parts() -> (u16, u8, u8, u8, u8, u8) {
         ((rest / 60) % 60) as u8,
         (rest % 60) as u8,
     )
+}
+
+/// 非 Windows 平台通过 `date +%z` 取一次本地时区偏移。
+#[cfg(not(windows))]
+fn local_offset_secs() -> i64 {
+    use std::sync::OnceLock;
+
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        let Ok(output) = std::process::Command::new("date").arg("+%z").output() else {
+            return 0;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let text = text.trim();
+        let bytes = text.as_bytes();
+        if bytes.len() < 5 {
+            return 0;
+        }
+        let sign = match bytes[0] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return 0,
+        };
+        let hours: i64 = text[1..3].parse().unwrap_or(0);
+        let minutes: i64 = text[3..5].parse().unwrap_or(0);
+        sign * (hours * 3600 + minutes * 60)
+    })
 }
 
 /// 由 Unix 天数换算公历年月日（UTC）。

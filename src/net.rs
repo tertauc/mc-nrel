@@ -8,32 +8,116 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::blocking::Client;
 use sha1::{Digest, Sha1};
+
+/// 轻量 HTTP 客户端封装，TLS 使用各平台系统实现。
+#[derive(Clone)]
+pub struct HttpClient {
+    user_agent: String,
+}
+
+const REQUEST_TIMEOUT_SECS: u64 = 600;
+
+impl HttpClient {
+    fn get(&self, url: &str) -> minreq::Request {
+        minreq::get(url)
+            .with_header("User-Agent", &self.user_agent)
+            .with_timeout(REQUEST_TIMEOUT_SECS)
+    }
+
+    fn post(&self, url: &str) -> minreq::Request {
+        minreq::post(url)
+            .with_header("User-Agent", &self.user_agent)
+            .with_timeout(REQUEST_TIMEOUT_SECS)
+    }
+
+    pub fn get_text(&self, url: &str) -> Result<String> {
+        let resp = self
+            .get(url)
+            .send_lazy()
+            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
+        read_text(resp)
+    }
+
+    /// 获取响应流，非 2xx 直接报错。
+    pub fn get_stream(&self, url: &str, bearer: Option<&str>) -> Result<minreq::ResponseLazy> {
+        let mut req = self.get(url);
+        if let Some(token) = bearer {
+            req = req.with_header("Authorization", format!("Bearer {token}"));
+        }
+        let resp = req
+            .send_lazy()
+            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
+        if !(200..300).contains(&resp.status_code) {
+            bail!("请求失败: {url}（HTTP {}）", resp.status_code);
+        }
+        Ok(resp)
+    }
+
+    /// 获取文本响应与状态码（4xx/5xx 也会返回）。
+    pub fn get_text_status(&self, url: &str, bearer: Option<&str>) -> Result<(u16, String)> {
+        let mut req = self.get(url);
+        if let Some(token) = bearer {
+            req = req.with_header("Authorization", format!("Bearer {token}"));
+        }
+        let resp = req
+            .send_lazy()
+            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
+        let status = resp.status_code as u16;
+        Ok((status, read_text(resp)?))
+    }
+
+    /// 发送文本请求，返回状态码与响应体（4xx/5xx 也会返回）。
+    pub fn post_text(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: &str,
+    ) -> Result<(u16, String)> {
+        let resp = self
+            .post(url)
+            .with_header("Content-Type", content_type)
+            .with_body(body)
+            .send_lazy()
+            .map_err(|err| anyhow::anyhow!("无法连接服务：{url}（{err}）"))?;
+        let status = resp.status_code as u16;
+        Ok((status, read_text(resp)?))
+    }
+}
+
+fn read_text(mut resp: minreq::ResponseLazy) -> Result<String> {
+    let mut text = String::new();
+    resp.read_to_string(&mut text)
+        .map_err(|err| anyhow::anyhow!("读取响应内容失败：{err}"))?;
+    Ok(text)
+}
+
+/// 响应头大小写不敏感查找。
+pub fn header<'a>(
+    headers: &'a std::collections::HashMap<String, String>,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
 
 fn progress(len: u64) -> ProgressBar {
     ProgressBar::new(len)
 }
 
-pub fn client() -> Result<Client> {
-    Client::builder()
-        .user_agent(format!(
+pub fn client() -> Result<HttpClient> {
+    Ok(HttpClient {
+        user_agent: format!(
             "NREL/{} (Minecraft Launcher)",
             env!("CARGO_PKG_VERSION")
-        ))
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(600))
-        .build()
-        .context("无法创建 HTTP 客户端")
+        ),
+    })
 }
 
-pub fn get_text(client: &Client, url: &str) -> Result<String> {
-    let resp = client
-        .get(url)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .with_context(|| format!("请求失败: {url}"))?;
-    resp.text().context("读取响应内容失败")
+pub fn get_text(client: &HttpClient, url: &str) -> Result<String> {
+    client.get_text(url)
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +194,7 @@ fn file_sha1(path: &std::path::Path) -> Option<String> {
 }
 
 fn download_once(
-    client: &Client,
+    client: &HttpClient,
     task: &DownloadTask,
     pb: Option<&ProgressBar>,
 ) -> Result<()> {
@@ -123,13 +207,11 @@ fn download_once(
             .with_context(|| format!("无法创建目录 {}", parent.display()))?;
     }
 
-    let resp = client
-        .get(&task.url)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .with_context(|| format!("下载失败: {}", task.url))?;
+    let resp = client.get_stream(&task.url, None)?;
 
-    let total = resp.content_length().or(task.size);
+    let total = header(&resp.headers, "Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(task.size);
     if let Some(pb) = pb {
         if let Some(total) = total {
             pb.set_length(total);
@@ -177,7 +259,7 @@ fn download_once(
     Ok(())
 }
 
-fn download_retry(client: &Client, task: &DownloadTask, pb: Option<&ProgressBar>) -> Result<()> {
+fn download_retry(client: &HttpClient, task: &DownloadTask, pb: Option<&ProgressBar>) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..3 {
         match download_once(client, task, pb) {
@@ -193,7 +275,7 @@ fn download_retry(client: &Client, task: &DownloadTask, pb: Option<&ProgressBar>
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("未知下载错误")))
 }
 
-pub fn download_one(client: &Client, task: &DownloadTask, label: &str) -> Result<()> {
+pub fn download_one(client: &HttpClient, task: &DownloadTask, label: &str) -> Result<()> {
     if existing_is_ok(task) {
         return Ok(());
     }
@@ -206,7 +288,7 @@ pub fn download_one(client: &Client, task: &DownloadTask, label: &str) -> Result
 }
 
 /// 多线程批量下载，已有且大小一致的文件会被跳过。
-pub fn download_many(client: &Client, mut tasks: Vec<DownloadTask>, label: &str) -> Result<()> {
+pub fn download_many(client: &HttpClient, mut tasks: Vec<DownloadTask>, label: &str) -> Result<()> {
     tasks.sort_by(|a, b| a.path.cmp(&b.path));
     tasks.dedup_by(|a, b| a.path == b.path);
     if tasks.is_empty() {
