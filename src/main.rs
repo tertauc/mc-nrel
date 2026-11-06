@@ -136,7 +136,10 @@ fn run(ui: &mut Ui) -> Result<()> {
             selected = 0;
         }
         let rows = overview_rows(&cfg, manifest.as_ref());
-        let items: Vec<String> = MAIN_MENU.iter().map(|item| item.to_string()).collect();
+        let mut items: Vec<String> = MAIN_MENU.iter().map(|item| item.to_string()).collect();
+        if let Some(manifest) = manifest.as_ref() {
+            items[0] = launch_menu_label(&cfg, manifest);
+        }
         let mirror_before = cfg.mirror;
         let pending = PENDING_ACTION.lock().unwrap().take();
         // 线程切回时恢复到它原先停留的界面。
@@ -846,6 +849,21 @@ fn current_version_id(cfg: &Config, manifest: &VersionManifest) -> String {
         return id.clone();
     }
     manifest.latest.release.clone()
+}
+
+/// 主菜单“启动游戏”项：附带当前版本号与版本文件夹名。
+fn launch_menu_label(cfg: &Config, manifest: &VersionManifest) -> String {
+    let id = current_version_id(cfg, manifest);
+    let locals = install::list_local_versions(&cfg.game_dir());
+    let folder = locals
+        .iter()
+        .find(|local| local.id == id && local.installed)
+        .or_else(|| locals.iter().find(|local| local.id == id))
+        .map(|local| local.folder.clone());
+    match folder {
+        Some(folder) => format!("启动游戏 - {id} ({folder})"),
+        None => format!("启动游戏 - {id}"),
+    }
 }
 
 fn memory_label(cfg: &Config) -> String {
