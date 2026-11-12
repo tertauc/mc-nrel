@@ -11,12 +11,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-minreq = { version = "2", default-features = false, features = ["https-native"] }
 unicode-width = "0.2"
+
+[target.'cfg(not(windows))'.dependencies]
+minreq = { version = "2", default-features = false, features = ["https-native"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinHttp",
     "Win32_System_Console",
     "Win32_System_SystemInformation",
     "Win32_UI_Shell",

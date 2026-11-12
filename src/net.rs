@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -16,38 +17,38 @@ pub struct HttpClient {
     user_agent: String,
 }
 
+#[cfg(not(windows))]
 const REQUEST_TIMEOUT_SECS: u64 = 600;
 
+/// 统一的响应类型：状态码、响应头与可流式读取的正文。
+pub struct Response {
+    pub status_code: u16,
+    pub headers: HashMap<String, String>,
+    reader: Box<dyn Read>,
+}
+
+impl Read for Response {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
 impl HttpClient {
-    fn get(&self, url: &str) -> minreq::Request {
-        minreq::get(url)
-            .with_header("User-Agent", &self.user_agent)
-            .with_timeout(REQUEST_TIMEOUT_SECS)
-    }
-
-    fn post(&self, url: &str) -> minreq::Request {
-        minreq::post(url)
-            .with_header("User-Agent", &self.user_agent)
-            .with_timeout(REQUEST_TIMEOUT_SECS)
-    }
-
     pub fn get_text(&self, url: &str) -> Result<String> {
-        let resp = self
-            .get(url)
-            .send_lazy()
-            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
+        let resp = self.send("GET", url, &[], None)?;
+        if !(200..300).contains(&resp.status_code) {
+            bail!("请求失败: {url}（HTTP {}）", resp.status_code);
+        }
         read_text(resp)
     }
 
     /// 获取响应流，非 2xx 直接报错。
-    pub fn get_stream(&self, url: &str, bearer: Option<&str>) -> Result<minreq::ResponseLazy> {
-        let mut req = self.get(url);
-        if let Some(token) = bearer {
-            req = req.with_header("Authorization", format!("Bearer {token}"));
-        }
-        let resp = req
-            .send_lazy()
-            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
+    pub fn get_stream(&self, url: &str, bearer: Option<&str>) -> Result<Response> {
+        let headers: Vec<(&str, String)> = match bearer {
+            Some(token) => vec![("Authorization", format!("Bearer {token}"))],
+            None => Vec::new(),
+        };
+        let resp = self.send("GET", url, &headers, None)?;
         if !(200..300).contains(&resp.status_code) {
             bail!("请求失败: {url}（HTTP {}）", resp.status_code);
         }
@@ -56,14 +57,12 @@ impl HttpClient {
 
     /// 获取文本响应与状态码（4xx/5xx 也会返回）。
     pub fn get_text_status(&self, url: &str, bearer: Option<&str>) -> Result<(u16, String)> {
-        let mut req = self.get(url);
-        if let Some(token) = bearer {
-            req = req.with_header("Authorization", format!("Bearer {token}"));
-        }
-        let resp = req
-            .send_lazy()
-            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
-        let status = resp.status_code as u16;
+        let headers: Vec<(&str, String)> = match bearer {
+            Some(token) => vec![("Authorization", format!("Bearer {token}"))],
+            None => Vec::new(),
+        };
+        let resp = self.send("GET", url, &headers, None)?;
+        let status = resp.status_code;
         Ok((status, read_text(resp)?))
     }
 
@@ -74,18 +73,14 @@ impl HttpClient {
         content_type: &str,
         body: &str,
     ) -> Result<(u16, String)> {
-        let resp = self
-            .post(url)
-            .with_header("Content-Type", content_type)
-            .with_body(body)
-            .send_lazy()
-            .map_err(|err| anyhow::anyhow!("无法连接服务：{url}（{err}）"))?;
-        let status = resp.status_code as u16;
+        let headers = [("Content-Type", content_type.to_string())];
+        let resp = self.send("POST", url, &headers, Some(body))?;
+        let status = resp.status_code;
         Ok((status, read_text(resp)?))
     }
 }
 
-fn read_text(mut resp: minreq::ResponseLazy) -> Result<String> {
+fn read_text(mut resp: Response) -> Result<String> {
     let mut text = String::new();
     resp.read_to_string(&mut text)
         .map_err(|err| anyhow::anyhow!("读取响应内容失败：{err}"))?;
@@ -93,14 +88,274 @@ fn read_text(mut resp: minreq::ResponseLazy) -> Result<String> {
 }
 
 /// 响应头大小写不敏感查找。
-pub fn header<'a>(
-    headers: &'a std::collections::HashMap<String, String>,
-    name: &str,
-) -> Option<&'a str> {
+pub fn header<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+/// Windows 使用系统自带的 WinHTTP，省掉整套第三方 TLS 与 HTTP 实现。
+#[cfg(windows)]
+impl HttpClient {
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, String)],
+        body: Option<&str>,
+    ) -> Result<Response> {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::Networking::WinHttp::{
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
+            WINHTTP_ADDREQ_FLAG_REPLACE, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_QUERY_STATUS_CODE, WinHttpAddRequestHeaders,
+            WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
+            WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts,
+        };
+
+        fn wide(text: &str) -> Vec<u16> {
+            let mut buffer: Vec<u16> = text.encode_utf16().collect();
+            buffer.push(0);
+            buffer
+        }
+
+        struct Handles {
+            session: *mut c_void,
+            connect: *mut c_void,
+            request: *mut c_void,
+        }
+
+        impl Drop for Handles {
+            fn drop(&mut self) {
+                unsafe {
+                    if !self.request.is_null() {
+                        WinHttpCloseHandle(self.request);
+                    }
+                    if !self.connect.is_null() {
+                        WinHttpCloseHandle(self.connect);
+                    }
+                    if !self.session.is_null() {
+                        WinHttpCloseHandle(self.session);
+                    }
+                }
+            }
+        }
+
+        struct Body {
+            request: *mut c_void,
+            _handles: Handles,
+            done: bool,
+        }
+
+        impl Read for Body {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.done || buf.is_empty() {
+                    return Ok(0);
+                }
+                let mut read = 0u32;
+                let ok = unsafe {
+                    WinHttpReadData(
+                        self.request,
+                        buf.as_mut_ptr() as *mut c_void,
+                        buf.len() as u32,
+                        &mut read,
+                    )
+                };
+                if ok == 0 || read == 0 {
+                    self.done = true;
+                    return Ok(0);
+                }
+                Ok(read as usize)
+            }
+        }
+
+        let (secure, host, port, path) = split_url(url)?;
+
+        unsafe {
+            let agent = wide(&self.user_agent);
+            let session = WinHttpOpen(
+                agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            );
+            if session.is_null() {
+                bail!("无法初始化系统网络：{url}（错误码 {}）", GetLastError());
+            }
+            let mut handles = Handles {
+                session,
+                connect: std::ptr::null_mut(),
+                request: std::ptr::null_mut(),
+            };
+            WinHttpSetTimeouts(session, 15_000, 15_000, 60_000, 600_000);
+
+            let host_wide = wide(&host);
+            let connect = WinHttpConnect(session, host_wide.as_ptr(), port, 0);
+            if connect.is_null() {
+                bail!("无法连接服务器：{host}（错误码 {}）", GetLastError());
+            }
+            handles.connect = connect;
+
+            let verb = wide(method);
+            let target = wide(&path);
+            let flags = if secure { WINHTTP_FLAG_SECURE } else { 0 };
+            let request = WinHttpOpenRequest(
+                connect,
+                verb.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                flags,
+            );
+            if request.is_null() {
+                bail!("无法创建请求：{url}（错误码 {}）", GetLastError());
+            }
+            handles.request = request;
+
+            if !headers.is_empty() {
+                let mut raw = String::new();
+                for (name, value) in headers {
+                    raw.push_str(name);
+                    raw.push_str(": ");
+                    raw.push_str(value);
+                    raw.push_str("\r\n");
+                }
+                let raw = wide(&raw);
+                WinHttpAddRequestHeaders(
+                    request,
+                    raw.as_ptr(),
+                    (raw.len() - 1) as u32,
+                    WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
+                );
+            }
+
+            let payload = body.map(|text| text.as_bytes());
+            let (ptr, len) = match payload {
+                Some(bytes) => (bytes.as_ptr() as *const c_void, bytes.len() as u32),
+                None => (std::ptr::null(), 0),
+            };
+            let sent = WinHttpSendRequest(request, std::ptr::null(), 0, ptr, len, len, 0);
+            if sent == 0 {
+                bail!("发送请求失败：{url}（错误码 {}）", GetLastError());
+            }
+            if WinHttpReceiveResponse(request, std::ptr::null_mut()) == 0 {
+                bail!("接收响应失败：{url}（错误码 {}）", GetLastError());
+            }
+
+            let mut status: u32 = 0;
+            let mut status_len = std::mem::size_of::<u32>() as u32;
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                std::ptr::null(),
+                &mut status as *mut u32 as *mut c_void,
+                &mut status_len,
+                std::ptr::null_mut(),
+            );
+
+            // WinHTTP 是宽字符接口，原始响应头按 UTF-16 返回。
+            let mut raw_headers = vec![0u16; 4096];
+            let mut raw_len = (raw_headers.len() * 2) as u32;
+            let mut parsed = HashMap::new();
+            let ok = WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_RAW_HEADERS_CRLF,
+                std::ptr::null(),
+                raw_headers.as_mut_ptr() as *mut c_void,
+                &mut raw_len,
+                std::ptr::null_mut(),
+            );
+            if ok != 0 {
+                raw_headers.truncate(raw_len as usize / 2);
+                let text = String::from_utf16_lossy(&raw_headers);
+                for line in text.split("\r\n").skip(1) {
+                    if let Some((name, value)) = line.split_once(':') {
+                        parsed.insert(name.trim().to_string(), value.trim().to_string());
+                    }
+                }
+            }
+
+            Ok(Response {
+                status_code: status as u16,
+                headers: parsed,
+                reader: Box::new(Body {
+                    request,
+                    _handles: handles,
+                    done: false,
+                }),
+            })
+        }
+    }
+}
+
+/// 其他平台使用轻量的 minreq，TLS 走系统实现。
+#[cfg(not(windows))]
+impl HttpClient {
+    fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, String)],
+        body: Option<&str>,
+    ) -> Result<Response> {
+        let mut request = if method == "POST" {
+            minreq::post(url)
+        } else {
+            minreq::get(url)
+        };
+        request = request
+            .with_header("User-Agent", &self.user_agent)
+            .with_timeout(REQUEST_TIMEOUT_SECS as i32);
+        for (name, value) in headers {
+            request = request.with_header(name, value);
+        }
+        if let Some(body) = body {
+            request = request.with_body(body);
+        }
+        let resp = request
+            .send_lazy()
+            .map_err(|err| anyhow::anyhow!("请求失败: {url}（{err}）"))?;
+        Ok(Response {
+            status_code: resp.status_code as u16,
+            headers: resp.headers.clone(),
+            reader: Box::new(resp),
+        })
+    }
+}
+
+/// 把 `https://host:port/path` 拆成 TLS 标记、主机、端口与路径。
+#[cfg(windows)]
+fn split_url(url: &str) -> Result<(bool, String, u16, String)> {
+    let (secure, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (false, rest)
+    } else {
+        bail!("不支持的地址：{url}");
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host.to_string(),
+            port.parse::<u16>()
+                .with_context(|| format!("地址端口不合法：{url}"))?,
+        ),
+        None => (
+            authority.to_string(),
+            if secure { 443 } else { 80 },
+        ),
+    };
+    if host.is_empty() {
+        bail!("地址缺少主机名：{url}");
+    }
+    Ok((secure, host, port, path.to_string()))
 }
 
 /// 单行原地刷新的极简进度显示，替代完整的进度条依赖。
