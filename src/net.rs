@@ -368,8 +368,11 @@ struct ProgressInner {
     label: Mutex<String>,
     total: AtomicU64,
     pos: AtomicU64,
-    bytes: bool,
+    bytes: std::sync::atomic::AtomicBool,
     last: Mutex<Option<Instant>>,
+    /// 为真时直接输出到 stderr，否则由界面读取并绘制。
+    interactive: std::sync::atomic::AtomicBool,
+    cancel: std::sync::atomic::AtomicBool,
 }
 
 impl Progress {
@@ -379,10 +382,30 @@ impl Progress {
                 label: Mutex::new(label),
                 total: AtomicU64::new(total),
                 pos: AtomicU64::new(0),
-                bytes,
+                bytes: std::sync::atomic::AtomicBool::new(bytes),
                 last: Mutex::new(None),
+                interactive: std::sync::atomic::AtomicBool::new(true),
+                cancel: std::sync::atomic::AtomicBool::new(false),
             }),
         }
+    }
+
+    /// 请求取消当前下载。
+    pub fn cancel(&self) {
+        self.inner.cancel.store(true, Ordering::SeqCst);
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.inner.cancel.load(Ordering::SeqCst)
+    }
+
+    /// 当前进度快照：说明文字、已完成、总量。
+    pub fn snapshot(&self) -> (String, u64, u64) {
+        (
+            self.inner.label.lock().unwrap().clone(),
+            self.inner.pos.load(Ordering::Relaxed),
+            self.inner.total.load(Ordering::Relaxed),
+        )
     }
 
     /// 按字节数显示进度的下载进度。
@@ -407,19 +430,32 @@ impl Progress {
         self.inner.pos.store(0, Ordering::Relaxed);
     }
 
+    /// 切换为按文件个数计数。
+    pub fn set_counter(&self, total: u64) {
+        self.inner.bytes.store(false, Ordering::Relaxed);
+        self.inner.total.store(total, Ordering::Relaxed);
+        self.inner.pos.store(0, Ordering::Relaxed);
+    }
+
     pub fn inc(&self, amount: u64) {
         self.inner.pos.fetch_add(amount, Ordering::Relaxed);
-        self.draw(false);
+        self.draw();
     }
 
     /// 结束显示，占用过的行用换行收尾。
     pub fn finish(&self) {
+        if !self.inner.interactive.load(Ordering::Relaxed) {
+            return;
+        }
         eprint!("\r\x1b[K");
         let _ = std::io::stderr().flush();
     }
 
-    fn draw(&self, force: bool) {
-        if !force {
+    fn draw(&self) {
+        if !self.inner.interactive.load(Ordering::Relaxed) {
+            return;
+        }
+        {
             let mut last = self.inner.last.lock().unwrap();
             if let Some(prev) = *last
                 && prev.elapsed() < Duration::from_millis(100)
@@ -432,7 +468,7 @@ impl Progress {
         let total = self.inner.total.load(Ordering::Relaxed);
         let pos = self.inner.pos.load(Ordering::Relaxed);
         let label = self.inner.label.lock().unwrap().clone();
-        let line = if self.inner.bytes {
+        let line = if self.inner.bytes.load(Ordering::Relaxed) {
             let percent = (pos.saturating_mul(100).checked_div(total)).unwrap_or(0).min(100);
             format!(
                 "{label}  {:>3}%  {}/{}",
@@ -500,6 +536,30 @@ pub fn client() -> Result<HttpClient> {
 pub fn get_text(client: &HttpClient, url: &str) -> Result<String> {
     client.get_text(url)
 }
+
+static ACTIVE: Mutex<Option<Progress>> = Mutex::new(None);
+
+/// 交给界面接管进度显示，下载期间界面轮询并自行绘制。
+pub fn begin_shared(label: &str) -> Progress {
+    let pb = Progress::new(label.to_string(), 0, true);
+    pb.inner.interactive.store(false, Ordering::Relaxed);
+    *ACTIVE.lock().unwrap() = Some(pb.clone());
+    pb
+}
+
+pub fn end_shared() {
+    let _ = ACTIVE.lock().unwrap().take();
+}
+
+fn shared() -> Option<Progress> {
+    ACTIVE.lock().unwrap().clone()
+}
+
+/// 界面是否已经请求取消下载。
+pub fn cancel_requested() -> bool {
+    shared().map(|pb| pb.cancelled()).unwrap_or(false)
+}
+
 
 #[derive(Debug, Clone)]
 pub struct DownloadTask {
@@ -595,6 +655,11 @@ fn download_once(
     let mut buf = vec![0u8; 16 * 1024];
 
     loop {
+        if cancel_requested() {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            bail!("下载已取消");
+        }
         let read = reader.read(&mut buf).context("读取下载数据失败")?;
         if read == 0 {
             break;
@@ -632,6 +697,9 @@ fn download_retry(client: &HttpClient, task: &DownloadTask, pb: Option<&Progress
         match download_once(client, task, pb) {
             Ok(()) => return Ok(()),
             Err(err) => {
+                if cancel_requested() {
+                    return Err(err);
+                }
                 last_err = Some(err);
                 if attempt < 2 {
                     thread::sleep(Duration::from_millis(800));
@@ -646,7 +714,8 @@ pub fn download_one(client: &HttpClient, task: &DownloadTask, label: &str) -> Re
     if existing_is_ok(task) {
         return Ok(());
     }
-    let pb = Progress::file(label);
+    let pb = shared().unwrap_or_else(|| Progress::file(label));
+    pb.set_label(label);
     if let Some(size) = task.size {
         pb.set_total(size);
     }
@@ -664,7 +733,14 @@ pub fn download_many(client: &HttpClient, mut tasks: Vec<DownloadTask>, label: &
     }
 
     let total = tasks.len() as u64;
-    let pb = Progress::counter(label, total);
+    let pb = match shared() {
+        Some(pb) => {
+            pb.set_counter(total);
+            pb.set_label(label);
+            pb
+        }
+        None => Progress::counter(label, total),
+    };
 
     let queue = Arc::new(Mutex::new(tasks.into_iter().collect::<VecDeque<_>>()));
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -677,6 +753,9 @@ pub fn download_many(client: &HttpClient, mut tasks: Vec<DownloadTask>, label: &
             let pb = pb.clone();
             scope.spawn(move || {
                 loop {
+                    if cancel_requested() {
+                        break;
+                    }
                     let task = queue.lock().unwrap().pop_front();
                     let Some(task) = task else {
                         break;

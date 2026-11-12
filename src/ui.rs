@@ -82,6 +82,10 @@ impl Ui {
         self.height
     }
 
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
     pub fn row(&self) -> u16 {
         self.row
     }

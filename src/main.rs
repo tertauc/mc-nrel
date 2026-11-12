@@ -1,6 +1,7 @@
 mod archive;
 mod auth;
 mod config;
+mod hosts;
 mod install;
 mod java;
 mod launch;
@@ -10,6 +11,7 @@ mod mirror;
 mod net;
 mod trash;
 mod ui;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -23,8 +25,9 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::style::Color;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::{Config, LogLevel, LoginMode};
-use crate::manifest::VersionManifest;
+use crate::config::{Config, LogLevel, LoginMode, UpdateMode};
+use crate::install::VersionJson;
+use crate::manifest::{VersionEntry, VersionManifest};
 use crate::mirror::MirrorKind;
 use crate::net::HttpClient;
 use crate::ui::{Ui, UiEvent};
@@ -85,12 +88,23 @@ impl VersionScope {
 const MC_TOKEN_LIFETIME: i64 = 24 * 60 * 60;
 
 fn main() {
+    // 清理上次更新留下的旧版本文件。
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        let _ = std::fs::remove_file(dir.join("nrel-old.exe"));
+    }
+    hosts::install_console_handler();
     match Ui::enter() {
         Ok(mut ui) => {
             let result = run(&mut ui);
             drop(ui);
+            hosts::restore();
             if let Err(err) = result {
                 eprintln!("启动器异常退出：{err:#}");
+            }
+            if RELAUNCH.load(Ordering::SeqCst) {
+                update::relaunch();
             }
         }
         Err(err) => eprintln!("无法初始化终端：{err:#}"),
@@ -113,6 +127,23 @@ fn run(ui: &mut Ui) -> Result<()> {
         cfg.game_dir().display(),
         cfg.isolation_label()
     ));
+
+    if cfg.github_accel {
+        match hosts::apply(&client) {
+            Ok(()) => {}
+            Err(err) => logs::info(format!("GitHub 加速未生效：{err:#}")),
+        }
+    } else {
+        // 关闭加速时顺带清理上次可能残留的条目。
+        hosts::restore();
+    }
+
+    if update::should_check(cfg.update_mode) {
+        check_update(ui, &client, &cfg)?;
+        if RELAUNCH.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+    }
 
     let mut manifest = match load_manifest(ui, &client, &cfg, false) {
         Ok(manifest) => Some(manifest),
@@ -274,6 +305,8 @@ struct CmdEnv<'a> {
 }
 
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 更新完成后需要重启启动器。
+static RELAUNCH: AtomicBool = AtomicBool::new(false);
 static PENDING_ACTION: Mutex<Option<MainAction>> = Mutex::new(None);
 
 /// 线程当前停留的界面，切换线程时据此恢复。
@@ -882,6 +915,159 @@ fn java_label(cfg: &Config) -> String {
 }
 
 /// 前台启动：安装与启动过程在当前线程界面展示，启动后回到界面并显示运行状态。
+/// 检查并安装启动器更新。
+fn check_update(ui: &mut Ui, client: &HttpClient, cfg: &Config) -> Result<()> {
+    let release = match update::check(client) {
+        Ok(Some(release)) => release,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            logs::info(format!("检查更新失败：{err:#}"));
+            return Ok(());
+        }
+    };
+    logs::info(format!("发现新版本 {}", release.version));
+
+    if cfg.update_mode == UpdateMode::Ask {
+        let choices = vec!["稍后".to_string(), format!("更新到 {}", release.version)];
+        let Some(choice) = ui.pick(
+            "发现新版本",
+            &format!(
+                "当前版本 {}，最新版本 {}",
+                env!("CARGO_PKG_VERSION"),
+                release.version
+            ),
+            &choices,
+            1,
+        )?
+        else {
+            return Ok(());
+        };
+        if choice != 1 {
+            return Ok(());
+        }
+    }
+
+    ui.begin_work("正在更新启动器", format!("下载 {}", release.version))?;
+    ui.flush()?;
+    if let Err(err) = update::install(client, &release) {
+        logs::error(format!("更新失败：{err:#}"));
+        ui.alert("更新失败", &format!("{err:#}"))?;
+        return Ok(());
+    }
+    RELAUNCH.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// 带进度显示与取消能力的版本安装。
+fn install_with_screen(
+    ui: &mut Ui,
+    client: &HttpClient,
+    cfg: &Config,
+    entry: &VersionEntry,
+) -> Result<VersionJson> {
+    let installed_before = install::is_version_installed(&cfg.game_dir(), &entry.id);
+    let progress = net::begin_shared(&format!("准备安装 {}", entry.id));
+    let worker = {
+        let client = client.clone();
+        let cfg = cfg.clone();
+        let entry = entry.clone();
+        std::thread::spawn(move || install::ensure_installed(&client, &cfg, &entry))
+    };
+
+    let mut cancelled = false;
+    let result = loop {
+        if worker.is_finished() {
+            break worker
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("安装线程异常结束")));
+        }
+        draw_install_screen(ui, &progress, &entry.id, cancelled)?;
+        let Some(event) = ui.poll_event(Duration::from_millis(150))? else {
+            continue;
+        };
+        match event {
+            UiEvent::Key(key) => match key.code {
+                KeyCode::Esc => {
+                    progress.cancel();
+                    cancelled = true;
+                }
+                KeyCode::Char('/') => {
+                    if let Some(command) = command_mode(ui)? {
+                        match command.trim() {
+                            "/cancel" => {
+                                progress.cancel();
+                                cancelled = true;
+                            }
+                            "/quit" | "/q" | "/exit" => {
+                                progress.cancel();
+                                QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                            }
+                            "/help" | "/h" | "/?" => {
+                                ui.notice(
+                                    "下载中的命令",
+                                    "/cancel 取消下载\n/quit 退出启动器\n/help 查看帮助",
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            },
+            UiEvent::Click(0) | UiEvent::Back => {
+                progress.cancel();
+                cancelled = true;
+            }
+            _ => {}
+        }
+    };
+    net::end_shared();
+
+    if cancelled && !installed_before {
+        // 取消后清理本次下载产生的文件，避免留下半成品。
+        let root = cfg.game_dir();
+        let _ = std::fs::remove_dir_all(install::version_dir(&root, &entry.id));
+        let _ = std::fs::remove_dir_all(install::natives_dir(&root, &entry.id));
+    }
+    result
+}
+
+fn draw_install_screen(
+    ui: &mut Ui,
+    progress: &net::Progress,
+    version: &str,
+    cancelling: bool,
+) -> Result<()> {
+    let (label, done, total) = progress.snapshot();
+    ui.header("安装游戏", version)?;
+    ui.blank()?;
+    ui.line(&format!("  {label}"))?;
+    ui.blank()?;
+
+    let width = (ui.width() as usize).saturating_sub(8).clamp(20, 50);
+    let (percent, filled) = if total > 0 {
+        let percent = done.saturating_mul(100).checked_div(total).unwrap_or(0).min(100);
+        (percent, (percent as usize * width) / 100)
+    } else {
+        (0, 0)
+    };
+    let bar = format!(
+        "  {}{}  {percent}%",
+        "█".repeat(filled),
+        "░".repeat(width - filled)
+    );
+    ui.line(&bar)?;
+    ui.blank()?;
+    if cancelling {
+        ui.dim_line("  正在取消，请稍候…")?;
+    } else {
+        ui.dim_line("  Esc 取消下载    / 命令")?;
+    }
+    ui.blank()?;
+    ui.menu(&["取消下载".to_string()], 0)?;
+    ui.footer("↑↓/滚轮 选择    Enter/点击 取消下载    Esc 取消    / 命令", false)
+}
+
 fn start_game(
     ui: &mut Ui,
     client: &HttpClient,
@@ -914,7 +1100,13 @@ fn start_game(
     ui.flush()?;
 
     let version = match manifest.find(&id) {
-        Some(entry) => install::ensure_installed(client, cfg, entry)?,
+        Some(entry) => {
+            if install::is_version_installed(&root, &entry.id) {
+                install::ensure_installed(client, cfg, entry)?
+            } else {
+                install_with_screen(ui, client, cfg, entry)?
+            }
+        }
         None => {
             let local = install::load_version_merged(&root, &id).with_context(|| {
                 format!("无法读取本地版本 {id}（可能缺少父版本 JSON）")
@@ -1521,6 +1713,16 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                     cfg.extra_jvm_args.trim()
                 }
             ),
+            format!(
+                "{}  {}",
+                pad_label("启动器更新", 13),
+                cfg.update_mode.label()
+            ),
+            format!(
+                "{}  {}",
+                pad_label("GitHub 加速", 13),
+                if cfg.github_accel { "开启" } else { "关闭" }
+            ),
         ];
 
         let Some(index) = ({
@@ -1684,6 +1886,53 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 };
                 cfg.extra_jvm_args = value;
                 cfg.save()?;
+            }
+            9 => {
+                let kinds = [UpdateMode::Auto, UpdateMode::Ask, UpdateMode::Off];
+                let choices: Vec<String> =
+                    kinds.iter().map(|kind| kind.label().to_string()).collect();
+                let default = kinds
+                    .iter()
+                    .position(|kind| *kind == cfg.update_mode)
+                    .unwrap_or(0);
+                let Some(choice) = ui.pick(
+                    "启动器更新",
+                    "发现新版本时如何处理",
+                    &choices,
+                    default,
+                )?
+                else {
+                    continue;
+                };
+                cfg.update_mode = kinds[choice];
+                cfg.save()?;
+            }
+            10 => {
+                let choices = vec!["关闭".to_string(), "开启".to_string()];
+                let default = if cfg.github_accel { 1 } else { 0 };
+                let Some(choice) = ui.pick(
+                    "GitHub 加速",
+                    "开启后改写 hosts 加速访问，需管理员权限",
+                    &choices,
+                    default,
+                )?
+                else {
+                    continue;
+                };
+                cfg.github_accel = choice == 1;
+                cfg.save()?;
+                if cfg.github_accel {
+                    if let Ok(client) = net::client() {
+                        match hosts::apply(&client) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                ui.alert("加速未生效", &format!("{err:#}"))?;
+                            }
+                        }
+                    }
+                } else {
+                    hosts::restore();
+                }
             }
             _ => {}
         }

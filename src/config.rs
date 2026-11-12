@@ -46,6 +46,29 @@ impl LogLevel {
     }
 }
 
+/// 启动器更新策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateMode {
+    /// 自动下载并安装更新。
+    #[default]
+    Auto,
+    /// 发现新版本时询问。
+    Ask,
+    /// 不检查更新。
+    Off,
+}
+
+impl UpdateMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动更新",
+            Self::Ask => "提示更新",
+            Self::Off => "关闭更新",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -61,6 +84,10 @@ pub struct Config {
     pub isolate_versions: bool,
     /// 日志记录等级。
     pub log_level: LogLevel,
+    /// 启动器更新策略。
+    pub update_mode: UpdateMode,
+    /// 启动时是否通过 hosts 加速 GitHub。
+    pub github_accel: bool,
     pub width: u32,
     pub height: u32,
     pub fullscreen: bool,
@@ -86,6 +113,8 @@ impl Default for Config {
             game_dir: None,
             isolate_versions: true,
             log_level: LogLevel::default(),
+            update_mode: UpdateMode::default(),
+            github_accel: true,
             width: 854,
             height: 480,
             fullscreen: false,
