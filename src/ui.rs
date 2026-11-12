@@ -978,12 +978,3 @@ fn char_width_of(ch: Option<&char>) -> usize {
     ch.and_then(|c| UnicodeWidthChar::width(*c)).unwrap_or(0)
 }
 
-pub fn step(title: impl std::fmt::Display, detail: impl std::fmt::Display) {
-    // 直接使用 ANSI 序列着色，避免为一处彩色输出引入额外依赖。
-    println!("  \x1b[36;1m›\x1b[0m \x1b[1m{title}\x1b[0m \x1b[2m{detail}\x1b[0m");
-}
-
-pub fn warn(message: impl std::fmt::Display) {
-    println!("  \x1b[33;1m!\x1b[0m \x1b[33m{message}\x1b[0m");
-}
-

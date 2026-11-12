@@ -117,7 +117,7 @@ fn run(ui: &mut Ui) -> Result<()> {
 
     // 每次启动创建独立的日志文件，放在 .nrel-cache 中。
     if let Err(err) = logs::init(cfg.log_level) {
-        ui::warn(format!("日志初始化失败：{err:#}"));
+        logs::error(format!("日志初始化失败：{err:#}"));
     }
     logs::info(format!("工作目录：{}", config::work_dir().display()));
     logs::info(format!(

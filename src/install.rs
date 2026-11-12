@@ -9,7 +9,6 @@ use crate::config::Config;
 use crate::manifest::VersionEntry;
 use crate::mirror::MirrorKind;
 use crate::net::{self, DownloadTask, HttpClient};
-use crate::ui;
 
 pub const LIBRARIES_BASE: &str = "https://libraries.minecraft.net";
 pub const ASSETS_BASE: &str = "https://resources.download.minecraft.net";
@@ -395,7 +394,7 @@ pub fn ensure_installed(
     let vdir = version_dir(&root, &entry.id);
     fs::create_dir_all(&vdir)?;
 
-    ui::step(format!("检查版本 {}", entry.id), "versions/".to_string());
+    crate::logs::info(format!("检查版本 {}（versions/）", entry.id));
 
     let version = match read_local_version(&root, &entry.id) {
         Some(v) => v,
@@ -416,7 +415,7 @@ pub fn ensure_installed(
             .with_hash(client_artifact.sha1.clone())
             .with_size(client_artifact.size);
         if !jar_path.is_file() {
-            ui::step("下载游戏客户端", entry.id.clone());
+            crate::logs::info(format!("下载游戏客户端 {}", entry.id));
             net::download_one(client, &task, "下载游戏客户端")?;
         } else {
             net::download_one(client, &task, "校验游戏客户端")?;
@@ -427,7 +426,7 @@ pub fn ensure_installed(
     let plan = plan_libraries(&version, &root, cfg.mirror, &features)?;
 
     if !plan.downloads.is_empty() {
-        ui::step("下载依赖库", format!("{} 个文件", plan.downloads.len()));
+        crate::logs::info(format!("下载依赖库 {} 个文件", plan.downloads.len()));
         net::download_many(client, plan.downloads, "下载依赖库")?;
     }
 
@@ -437,7 +436,7 @@ pub fn ensure_installed(
     {
         let path = assets_dir(&root).join("log_configs").join(&logging.file.id);
         if let Err(err) = ensure_log_config(client, cfg.mirror, &logging.file, &path) {
-            ui::warn(format!("日志配置下载失败，已跳过：{err:#}"));
+            crate::logs::error(format!("日志配置下载失败，已跳过：{err:#}"));
         }
     }
 
@@ -512,7 +511,7 @@ fn ensure_assets(
     }
 
     if !index_path.is_file() {
-        ui::warn("该版本没有可用的资源索引，跳过资源下载");
+        crate::logs::info("该版本没有可用的资源索引，跳过资源下载");
         return Ok(());
     }
 
@@ -535,7 +534,7 @@ fn ensure_assets(
     }
 
     if !tasks.is_empty() {
-        ui::step("下载游戏资源", format!("{} 个文件", tasks.len()));
+        crate::logs::info(format!("下载游戏资源 {} 个文件", tasks.len()));
         net::download_many(client, tasks, "下载游戏资源")?;
     }
 
@@ -569,7 +568,7 @@ fn ensure_assets(
             }
         }
         if copied > 0 {
-            ui::step("整理旧版资源文件", format!("{copied} 个文件"));
+            crate::logs::info(format!("整理旧版资源文件 {copied} 个文件"));
         }
     }
 

@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "nrel"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "crossterm",
