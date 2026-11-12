@@ -114,7 +114,7 @@ impl Default for Config {
             isolate_versions: true,
             log_level: LogLevel::default(),
             update_mode: UpdateMode::default(),
-            github_accel: true,
+            github_accel: false,
             width: 854,
             height: 480,
             fullscreen: false,

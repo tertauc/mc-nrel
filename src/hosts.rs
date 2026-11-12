@@ -18,6 +18,23 @@ pub fn is_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }
 
+/// 当前进程是否拥有修改 hosts 所需的权限。
+#[cfg(windows)]
+pub fn is_admin() -> bool {
+    use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
+
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+#[cfg(not(windows))]
+pub fn is_admin() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
 fn hosts_path() -> PathBuf {
     #[cfg(windows)]
     {

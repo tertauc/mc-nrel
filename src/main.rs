@@ -1908,17 +1908,27 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 cfg.save()?;
             }
             10 => {
-                let choices = vec!["关闭".to_string(), "开启".to_string()];
+                let choices = vec![
+                    "关闭".to_string(),
+                    "开启（需以管理员权限运行启动器）".to_string(),
+                ];
                 let default = if cfg.github_accel { 1 } else { 0 };
                 let Some(choice) = ui.pick(
                     "GitHub 加速",
-                    "开启后改写 hosts 加速访问，需管理员权限",
+                    "开启后改写 hosts 加速访问",
                     &choices,
                     default,
                 )?
                 else {
                     continue;
                 };
+                if choice == 1 && !hosts::is_admin() {
+                    ui.alert(
+                        "无法开启加速",
+                        "当前不是管理员权限，请右键启动器选择“以管理员身份运行”后再开启。",
+                    )?;
+                    continue;
+                }
                 cfg.github_accel = choice == 1;
                 cfg.save()?;
                 if cfg.github_accel {
