@@ -2,7 +2,6 @@ use std::io::{Stdout, Write};
 use std::time::Duration;
 
 use anyhow::Result;
-use console::style;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -712,7 +711,10 @@ impl Ui {
                 blink = !blink;
                 continue;
             };
-            blink = true;
+            // 鼠标移动只会带来重绘，不应重置光标相位，否则光标会快速闪烁。
+            if matches!(ui_event, UiEvent::Key(_)) {
+                blink = true;
+            }
             let UiEvent::Key(key) = ui_event else {
                 continue;
             };
@@ -965,15 +967,11 @@ fn char_width_of(ch: Option<&char>) -> usize {
 }
 
 pub fn step(title: impl std::fmt::Display, detail: impl std::fmt::Display) {
-    println!(
-        "  {} {} {}",
-        style("›").cyan().bold(),
-        style(title).bold(),
-        style(detail).dim()
-    );
+    // 直接使用 ANSI 序列着色，避免为一处彩色输出引入额外依赖。
+    println!("  \x1b[36;1m›\x1b[0m \x1b[1m{title}\x1b[0m \x1b[2m{detail}\x1b[0m");
 }
 
 pub fn warn(message: impl std::fmt::Display) {
-    println!("  {} {}", style("!").yellow().bold(), style(message).yellow());
+    println!("  \x1b[33;1m!\x1b[0m \x1b[33m{message}\x1b[0m");
 }
 

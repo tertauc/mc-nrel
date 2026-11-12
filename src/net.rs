@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use indicatif::{ProgressBar, ProgressStyle};
 use sha1::{Digest, Sha1};
 
 /// 轻量 HTTP 客户端封装，TLS 使用各平台系统实现。
@@ -103,8 +103,134 @@ pub fn header<'a>(
         .map(|(_, value)| value.as_str())
 }
 
-fn progress(len: u64) -> ProgressBar {
-    ProgressBar::new(len)
+/// 单行原地刷新的极简进度显示，替代完整的进度条依赖。
+#[derive(Clone)]
+pub struct Progress {
+    inner: Arc<ProgressInner>,
+}
+
+struct ProgressInner {
+    label: Mutex<String>,
+    total: AtomicU64,
+    pos: AtomicU64,
+    bytes: bool,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Progress {
+    fn new(label: String, total: u64, bytes: bool) -> Self {
+        Self {
+            inner: Arc::new(ProgressInner {
+                label: Mutex::new(label),
+                total: AtomicU64::new(total),
+                pos: AtomicU64::new(0),
+                bytes,
+                last: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// 按字节数显示进度的下载进度。
+    pub fn file(label: &str) -> Self {
+        Self::new(label.to_string(), 0, true)
+    }
+
+    /// 按文件个数显示进度的批量进度。
+    pub fn counter(label: &str, total: u64) -> Self {
+        Self::new(label.to_string(), total, false)
+    }
+
+    pub fn set_total(&self, total: u64) {
+        self.inner.total.store(total, Ordering::Relaxed);
+    }
+
+    pub fn set_label(&self, label: &str) {
+        *self.inner.label.lock().unwrap() = label.to_string();
+    }
+
+    pub fn reset(&self) {
+        self.inner.pos.store(0, Ordering::Relaxed);
+    }
+
+    pub fn inc(&self, amount: u64) {
+        self.inner.pos.fetch_add(amount, Ordering::Relaxed);
+        self.draw(false);
+    }
+
+    /// 结束显示，占用过的行用换行收尾。
+    pub fn finish(&self) {
+        eprint!("\r\x1b[K");
+        let _ = std::io::stderr().flush();
+    }
+
+    fn draw(&self, force: bool) {
+        if !force {
+            let mut last = self.inner.last.lock().unwrap();
+            if let Some(prev) = *last
+                && prev.elapsed() < Duration::from_millis(100)
+            {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+
+        let total = self.inner.total.load(Ordering::Relaxed);
+        let pos = self.inner.pos.load(Ordering::Relaxed);
+        let label = self.inner.label.lock().unwrap().clone();
+        let line = if self.inner.bytes {
+            let percent = (pos.saturating_mul(100).checked_div(total)).unwrap_or(0).min(100);
+            format!(
+                "{label}  {:>3}%  {}/{}",
+                percent,
+                human_size(pos),
+                human_size(total)
+            )
+        } else {
+            format!("{label}  {pos}/{total}")
+        };
+        // 截断到终端一行的安全长度，避免折行破坏界面。
+        let width = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+        let line = truncate_display(&line, width.saturating_sub(2));
+        eprint!("\r\x1b[K  {line}");
+        let _ = std::io::stderr().flush();
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn truncate_display(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        use unicode_width::UnicodeWidthChar;
+
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width.saturating_sub(3) {
+            result.push_str("...");
+            break;
+        }
+        result.push(ch);
+        used += w;
+    }
+    result
 }
 
 pub fn client() -> Result<HttpClient> {
@@ -149,20 +275,6 @@ impl DownloadTask {
     }
 }
 
-pub fn file_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.green} {msg}  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, 剩余 {eta})",
-    )
-    .unwrap()
-    .progress_chars("=>-")
-}
-
-pub fn count_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.green} {msg}  [{bar:40.cyan/blue}] {pos}/{len}")
-        .unwrap()
-        .progress_chars("=>-")
-}
-
 fn existing_is_ok(task: &DownloadTask) -> bool {
     let Ok(meta) = fs::metadata(&task.path) else {
         return false;
@@ -196,7 +308,7 @@ fn file_sha1(path: &std::path::Path) -> Option<String> {
 fn download_once(
     client: &HttpClient,
     task: &DownloadTask,
-    pb: Option<&ProgressBar>,
+    pb: Option<&Progress>,
 ) -> Result<()> {
     if existing_is_ok(task) {
         return Ok(());
@@ -214,10 +326,10 @@ fn download_once(
         .or(task.size);
     if let Some(pb) = pb {
         if let Some(total) = total {
-            pb.set_length(total);
+            pb.set_total(total);
         }
-        pb.set_position(0);
-        pb.set_message(short_name(&task.path));
+        pb.reset();
+        pb.set_label(&short_name(&task.path));
     }
 
     let tmp = temp_path(&task.path);
@@ -259,7 +371,7 @@ fn download_once(
     Ok(())
 }
 
-fn download_retry(client: &HttpClient, task: &DownloadTask, pb: Option<&ProgressBar>) -> Result<()> {
+fn download_retry(client: &HttpClient, task: &DownloadTask, pb: Option<&Progress>) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..3 {
         match download_once(client, task, pb) {
@@ -279,11 +391,12 @@ pub fn download_one(client: &HttpClient, task: &DownloadTask, label: &str) -> Re
     if existing_is_ok(task) {
         return Ok(());
     }
-    let pb = progress(task.size.unwrap_or(0));
-    pb.set_style(file_style());
-    pb.set_message(label.to_string());
+    let pb = Progress::file(label);
+    if let Some(size) = task.size {
+        pb.set_total(size);
+    }
     let result = download_retry(client, task, Some(&pb));
-    pb.finish_and_clear();
+    pb.finish();
     result
 }
 
@@ -296,9 +409,7 @@ pub fn download_many(client: &HttpClient, mut tasks: Vec<DownloadTask>, label: &
     }
 
     let total = tasks.len() as u64;
-    let pb = progress(total);
-    pb.set_style(count_style());
-    pb.set_message(label.to_string());
+    let pb = Progress::counter(label, total);
 
     let queue = Arc::new(Mutex::new(tasks.into_iter().collect::<VecDeque<_>>()));
     let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -327,7 +438,7 @@ pub fn download_many(client: &HttpClient, mut tasks: Vec<DownloadTask>, label: &
         }
     });
 
-    pb.finish_and_clear();
+    pb.finish();
     let errors = errors.lock().unwrap();
     if !errors.is_empty() {
         bail!(

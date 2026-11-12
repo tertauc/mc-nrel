@@ -1,24 +1,26 @@
 [package]
 name = "nrel"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1"
-console = "0.15"
 crossterm = "0.28"
-indicatif = "0.17"
 md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
-form_urlencoded = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 minreq = { version = "2", default-features = false, features = ["https-native"] }
 unicode-width = "0.2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+] }
 
 [profile.release]
 opt-level = "z"

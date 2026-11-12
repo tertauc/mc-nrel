@@ -1,3 +1,4 @@
+mod archive;
 mod auth;
 mod config;
 mod install;
@@ -7,6 +8,7 @@ mod logs;
 mod manifest;
 mod mirror;
 mod net;
+mod trash;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -448,8 +450,7 @@ fn delete_thread(index: usize) -> Result<usize> {
     Ok(active)
 }
 
-const MAIN_HINT: &str =
-    "↑↓/滚轮 选择    Enter/点击 确认    / 命令    Esc 不可用，请选择“退出”";
+const MAIN_HINT: &str = "↑↓/滚轮 选择    Enter/点击 确认    / 命令";
 
 fn main_menu(
     ui: &mut Ui,
@@ -1120,6 +1121,12 @@ fn collect_versions(root: &Path, manifest: &VersionManifest) -> Vec<VersionRow> 
     rows
 }
 
+/// 二选一确认框，返回是否选择了“确认”。
+fn confirm_dialog(ui: &mut Ui, title: &str, message: &str) -> Result<bool> {
+    let items = vec!["取消".to_string(), "移入回收站".to_string()];
+    Ok(ui.pick(title, message, &items, 0)? == Some(1))
+}
+
 fn choose_version(
     ui: &mut Ui,
     client: &HttpClient,
@@ -1189,7 +1196,7 @@ fn choose_version(
         let installed_count = rows.iter().filter(|row| row.installed).count();
         ui.header(
             "版本选择",
-            "F1 最新正式版    F2 最新快照    F5 刷新列表    Tab 切换范围    Enter/点击 选择并启动    Esc 返回",
+            "F1 最新正式版    F2 最新快照    F5 刷新列表    Tab 切换范围    Enter/点击 选择并启动    Del 删除版本    Esc 返回",
         )?;
         ui.card(
             "快捷启动",
@@ -1241,7 +1248,7 @@ fn choose_version(
             ui.line(&format!("  已选 {} · {} · {status}", row.id, row.kind))?;
         }
         ui.footer(
-            "↑↓/滚轮 选择    Enter/点击 选择并启动    F1/F2 快捷启动    F5 刷新    Tab 切换    Esc 返回",
+            "↑↓/滚轮 选择    Enter/点击 选择并启动    F1/F2 快捷启动    F5 刷新    Tab 切换    Del 删除    Esc 返回",
             true,
         )?;
         ui.flush()?;
@@ -1249,7 +1256,10 @@ fn choose_version(
         // 等待输入期间让筛选框的光标闪烁，只重绘筛选行。
         let event = loop {
             if let Some(event) = ui.poll_event(ui::BLINK_INTERVAL)? {
-                blink = true;
+                // 鼠标移动只触发重绘，不能重置光标相位，否则会快速闪烁。
+                if matches!(event, UiEvent::Key(_)) {
+                    blink = true;
+                }
                 break event;
             }
             blink = !blink;
@@ -1312,6 +1322,47 @@ fn choose_version(
                     continue;
                 }
                 KeyCode::Enter => confirm = true,
+                KeyCode::Delete => {
+                    let Some(&index) = visible.get(selected) else {
+                        continue;
+                    };
+                    let (folder, id, installed) = {
+                        let row = &rows[index];
+                        (row.folder.clone(), row.id.clone(), row.installed)
+                    };
+                    let Some(folder) = folder else {
+                        ui.alert("无法删除", "该版本没有对应的本地文件夹。")?;
+                        continue;
+                    };
+                    if !installed {
+                        ui.alert("无法删除", "该版本尚未安装，没有可删除的文件。")?;
+                        continue;
+                    }
+                    let path = root.join("versions").join(&folder);
+                    if !path.is_dir() {
+                        ui.alert(
+                            "无法删除",
+                            &format!("没有找到版本目录：{}", path.display()),
+                        )?;
+                        continue;
+                    }
+                    if !confirm_dialog(ui, "删除版本", &format!("将 {folder} 移入回收站？"))? {
+                        continue;
+                    }
+                    if let Err(err) = trash::move_to_trash(&path) {
+                        logs::error(format!("删除版本 {folder} 失败：{err:#}"));
+                        ui.alert("删除失败", &format!("{err:#}"))?;
+                        continue;
+                    }
+                    logs::info(format!("版本 {folder} 已移入回收站"));
+                    if cfg.last_version.as_deref() == Some(id.as_str()) {
+                        cfg.last_version = None;
+                        cfg.save()?;
+                    }
+                    rows = collect_versions(&root, manifest);
+                    selected = 0;
+                    start = 0;
+                }
                 KeyCode::Tab => {
                     scope = scope.next();
                     selected = 0;

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -818,37 +817,7 @@ fn maven_path(coords: &str) -> Option<String> {
 }
 
 fn extract_natives(jar: &Path, dest: &Path, exclude: &[String]) -> Result<()> {
-    let file = fs::File::open(jar)
-        .with_context(|| format!("无法打开本地库 {}", jar.display()))?;
-    let mut archive = zip::ZipArchive::new(file).context("解析本地库失败")?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).context("读取压缩包条目失败")?;
-        let Some(entry_path) = entry.enclosed_name() else {
-            continue;
-        };
-        let entry_name = entry_path.to_string_lossy().replace('\\', "/");
-        if exclude
-            .iter()
-            .any(|prefix| entry_name.starts_with(prefix.as_str()))
-        {
-            continue;
-        }
-        if entry.is_dir() {
-            continue;
-        }
-
-        let out = dest.join(&entry_path);
-        if let Some(parent) = out.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut out_file = fs::File::create(&out)
-            .with_context(|| format!("无法解压文件 {}", out.display()))?;
-        let mut buffer = Vec::new();
-        entry.read_to_end(&mut buffer)?;
-        std::io::Write::write_all(&mut out_file, &buffer)?;
-    }
-    Ok(())
+    crate::archive::extract(jar, dest, exclude)
 }
 
 /// 把版本 JSON 中的 `${placeholder}` 替换为实际值。

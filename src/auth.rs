@@ -196,11 +196,35 @@ fn post_form(
     url: &str,
     form: &[(&str, &str)],
 ) -> Result<(u16, Value)> {
-    let body: String = form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(form)
-        .finish();
+    let body = encode_form(form);
     let (status, text) = client.post_text(url, "application/x-www-form-urlencoded", &body)?;
     Ok((status, parse_json(&text)))
+}
+
+/// 按 `application/x-www-form-urlencoded` 规则编码表单。
+fn encode_form(form: &[(&str, &str)]) -> String {
+    fn push(value: &str, out: &mut String) {
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                    out.push(byte as char);
+                }
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+    }
+
+    let mut out = String::new();
+    for (index, (key, value)) in form.iter().enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        push(key, &mut out);
+        out.push('=');
+        push(value, &mut out);
+    }
+    out
 }
 
 fn post_json(client: &HttpClient, url: &str, body: &Value) -> Result<(u16, Value)> {
