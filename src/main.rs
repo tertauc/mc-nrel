@@ -1931,14 +1931,12 @@ fn settings_menu(ui: &mut Ui, cfg: &mut Config) -> Result<()> {
                 }
                 cfg.github_accel = choice == 1;
                 cfg.save()?;
+                // 开关变化后立即同步到 hosts；没有管理员权限时静默跳过。
                 if cfg.github_accel {
-                    if let Ok(client) = net::client() {
-                        match hosts::apply(&client) {
-                            Ok(()) => {}
-                            Err(err) => {
-                                ui.alert("加速未生效", &format!("{err:#}"))?;
-                            }
-                        }
+                    if let Ok(client) = net::client()
+                        && let Err(err) = hosts::apply(&client)
+                    {
+                        logs::info(format!("GitHub 加速未生效：{err:#}"));
                     }
                 } else {
                     hosts::restore();

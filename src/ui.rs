@@ -52,6 +52,8 @@ pub struct Ui {
     hover_back: bool,
     /// 底部提示行绘制前的正文结束行，用于清除正文与底栏之间的残留。
     gap_start: Option<u16>,
+    /// 由鼠标移动去抖逻辑暂存的事件，下次读取时优先处理。
+    pending: Option<Event>,
 }
 
 impl Ui {
@@ -75,6 +77,7 @@ impl Ui {
             back_row: None,
             hover_back: false,
             gap_start: None,
+            pending: None,
         })
     }
 
@@ -176,7 +179,15 @@ impl Ui {
 
     pub fn header(&mut self, title: &str, subtitle: &str) -> Result<()> {
         self.begin()?;
-        self.print_line("  NREL  ·  Minecraft Launcher", Some(Color::Cyan), true, false)?;
+        self.print_line(
+            &format!(
+                "  NREL  ·  Minecraft Launcher  v{}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            Some(Color::Cyan),
+            true,
+            false,
+        )?;
         self.blank()?;
         self.print_line(&format!("  {title}"), Some(Color::White), true, false)?;
         if !subtitle.is_empty() {
@@ -462,7 +473,11 @@ impl Ui {
     /// 阻塞等待一次有效输入（按键、点击列表项或滚轮）。
     pub fn wait(&mut self) -> Result<UiEvent> {
         loop {
-            if let Some(ui_event) = self.read_event()? {
+            let event = match self.next_event()? {
+                Some(event) => event,
+                None => event::read()?,
+            };
+            if let Some(ui_event) = self.handle_event(event)? {
                 return Ok(ui_event);
             }
         }
@@ -470,21 +485,35 @@ impl Ui {
 
     /// 在超时内等待一次有效输入；超时返回 `None`。
     pub fn poll_event(&mut self, timeout: Duration) -> Result<Option<UiEvent>> {
-        if !event::poll(timeout)? {
+        if self.pending.is_none() && !event::poll(timeout)? {
             return Ok(None);
         }
         loop {
-            if let Some(ui_event) = self.read_event()? {
+            let Some(event) = self.next_event()? else {
+                return Ok(None);
+            };
+            if let Some(ui_event) = self.handle_event(event)? {
                 return Ok(Some(ui_event));
             }
-            if !event::poll(Duration::from_millis(0))? {
+            if self.pending.is_none() && !event::poll(Duration::from_millis(0))? {
                 return Ok(None);
             }
         }
     }
 
-    fn read_event(&mut self) -> Result<Option<UiEvent>> {
-        match event::read()? {
+    /// 取下一个原始事件：优先返回去抖时暂存的事件，否则在有事件时立即读取。
+    fn next_event(&mut self) -> Result<Option<Event>> {
+        if let Some(event) = self.pending.take() {
+            return Ok(Some(event));
+        }
+        if event::poll(Duration::ZERO)? {
+            return Ok(Some(event::read()?));
+        }
+        Ok(None)
+    }
+
+    fn handle_event(&mut self, event: Event) -> Result<Option<UiEvent>> {
+        match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 // 键盘操作后取消鼠标悬停高亮。
                 self.hover = None;
@@ -510,6 +539,8 @@ impl Ui {
                     }
                     self.hover = item;
                     self.hover_back = over_back;
+                    // 连续移动合并为一次重绘，避免整屏高频刷新造成闪烁。
+                    self.settle_moves()?;
                     Ok(Some(UiEvent::Redraw))
                 }
                 MouseEventKind::ScrollUp => {
@@ -525,6 +556,29 @@ impl Ui {
                 _ => Ok(None),
             },
             _ => Ok(None),
+        }
+    }
+
+    /// 鼠标持续移动时不断更新悬停目标，停顿约 50ms 后才返回，从而只重绘一次。
+    fn settle_moves(&mut self) -> Result<()> {
+        loop {
+            if !event::poll(Duration::from_millis(50))? {
+                return Ok(());
+            }
+            match event::read()? {
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+                    self.hover = self
+                        .clicks
+                        .iter()
+                        .find(|(click_row, _)| *click_row == mouse.row)
+                        .copied();
+                    self.hover_back = self.back_row == Some(mouse.row);
+                }
+                other => {
+                    self.pending = Some(other);
+                    return Ok(());
+                }
+            }
         }
     }
 
@@ -668,6 +722,7 @@ impl Ui {
         let mut error: Option<String> = None;
         let mut blink = true;
         let mut full = true;
+        let mut dirty = true;
         let mut input_row = 0u16;
 
         loop {
@@ -689,30 +744,35 @@ impl Ui {
                 }
                 self.footer("Enter 确认    Esc 取消", false)?;
                 full = false;
+                dirty = true;
             }
 
-            // 光标用自行绘制的闪烁竖线，不再依赖终端系统光标。
-            let caret = if blink { "▏" } else { " " };
-            let padding = text_max.saturating_sub(before_width + after_width);
-            queue!(
-                self.out,
-                MoveTo(0, input_row),
-                Clear(ClearType::CurrentLine),
-                SetForegroundColor(Color::Cyan),
-                SetAttribute(Attribute::Bold),
-                MoveTo(2, input_row),
-                Print("› "),
-                ResetColor,
-                SetAttribute(Attribute::Reset),
-                Print(before),
-                Print(caret),
-                Print(after),
-                Print(" ".repeat(padding))
-            )?;
-            self.flush()?;
+            // 只在内容或光标相位变化时重绘，鼠标移动不重绘输入行。
+            if dirty {
+                let caret = if blink { "▏" } else { " " };
+                let padding = text_max.saturating_sub(before_width + after_width);
+                queue!(
+                    self.out,
+                    MoveTo(0, input_row),
+                    Clear(ClearType::CurrentLine),
+                    SetForegroundColor(Color::Cyan),
+                    SetAttribute(Attribute::Bold),
+                    MoveTo(2, input_row),
+                    Print("› "),
+                    ResetColor,
+                    SetAttribute(Attribute::Reset),
+                    Print(before),
+                    Print(caret),
+                    Print(after),
+                    Print(" ".repeat(padding))
+                )?;
+                self.flush()?;
+                dirty = false;
+            }
 
             let Some(ui_event) = self.poll_event(BLINK_INTERVAL)? else {
                 blink = !blink;
+                dirty = true;
                 continue;
             };
             // 鼠标移动只会带来重绘，不应重置光标相位，否则光标会快速闪烁。
@@ -722,6 +782,7 @@ impl Ui {
             let UiEvent::Key(key) = ui_event else {
                 continue;
             };
+            dirty = true;
 
             match key.code {
                 KeyCode::Esc => return Ok(None),
