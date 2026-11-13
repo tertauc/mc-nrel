@@ -975,13 +975,20 @@ fn install_with_screen(
     };
 
     let mut cancelled = false;
+    let mut last_draw: Option<(String, u64, u64, bool, u16, u16)> = None;
     let result = loop {
         if worker.is_finished() {
             break worker
                 .join()
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("安装线程异常结束")));
         }
-        draw_install_screen(ui, &progress, &entry.id, cancelled)?;
+        let (label, done, total) = progress.snapshot();
+        let key = (label, done, total, cancelled, ui.width(), ui.height());
+        // 内容没变化就不重绘，减少闪动。
+        if last_draw.as_ref() != Some(&key) {
+            draw_install_screen(ui, &key.0, done, total, &entry.id, cancelled)?;
+            last_draw = Some(key);
+        }
         let Some(event) = ui.poll_event(Duration::from_millis(150))? else {
             continue;
         };
@@ -1034,11 +1041,12 @@ fn install_with_screen(
 
 fn draw_install_screen(
     ui: &mut Ui,
-    progress: &net::Progress,
+    label: &str,
+    done: u64,
+    total: u64,
     version: &str,
     cancelling: bool,
 ) -> Result<()> {
-    let (label, done, total) = progress.snapshot();
     ui.header("安装游戏", version)?;
     ui.blank()?;
     ui.line(&format!("  {label}"))?;

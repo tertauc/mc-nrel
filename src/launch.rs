@@ -241,5 +241,13 @@ pub fn build_command(
         .args(&game_args)
         .current_dir(&root);
 
+    // 游戏运行在独立的控制台中，关闭启动器窗口时不会被一起结束。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+
     Ok(command)
 }

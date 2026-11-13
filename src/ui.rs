@@ -1,4 +1,4 @@
-use std::io::{Stdout, Write};
+use std::io::{BufWriter, Stdout, Write};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -36,7 +36,7 @@ pub enum UiEvent {
 }
 
 pub struct Ui {
-    out: Stdout,
+    out: BufWriter<Stdout>,
     width: u16,
     height: u16,
     row: u16,
@@ -59,7 +59,7 @@ impl Ui {
         // 统一使用 UTF-8 代码页，避免中文界面出现乱码。
         let codepage = switch_to_utf8();
         enable_raw_mode()?;
-        let mut out = std::io::stdout();
+        let mut out = BufWriter::with_capacity(64 * 1024, std::io::stdout());
         execute!(out, EnterAlternateScreen, Hide)?;
         // 部分终端不支持鼠标上报，失败时不影响启动。
         let _ = execute!(out, EnableMouseCapture);
@@ -91,7 +91,12 @@ impl Ui {
     }
 
     pub fn begin(&mut self) -> Result<()> {
-        let (width, height) = terminal::size()?;
+        let (mut width, mut height) = terminal::size().unwrap_or((self.width, self.height));
+        // 部分终端在窗口失焦或最小化时会返回 0，不能据此整屏重绘。
+        if width == 0 || height == 0 {
+            width = self.width;
+            height = self.height;
+        }
         let resized = width != self.width || height != self.height;
         self.width = width;
         self.height = height;
